@@ -20,6 +20,15 @@ const electronAPI = {
   /** Open a URL in the system browser. */
   openExternal: (url) => ipcRenderer.invoke("shell:openExternal", url),
 
+  /** Run setup command (for first-time initialization). */
+  runSetup: () => ipcRenderer.invoke("run-setup"),
+
+  /** Notify that setup is complete. */
+  notifySetupComplete: () => ipcRenderer.send("setup-complete"),
+
+  /** Quit the application. */
+  quitApp: () => ipcRenderer.send("quit-app"),
+
   /** Listen for gateway-ready event. Returns unsubscribe function. */
   onGatewayReady: (callback) => {
     const handler = (_event, data) => callback(data);

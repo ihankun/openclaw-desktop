@@ -8,7 +8,7 @@
  * Usage: node scripts/stage-gateway.mjs
  */
 
-import { cpSync, existsSync, mkdirSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, readdirSync } from "node:fs";
 import { execSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -101,6 +101,38 @@ if (existsSync(lockFile)) rmSync(lockFile);
 
 // ── 5. Summary ──
 console.log("\n── Summary ──");
-const size = execSync(`du -sh "${STAGING_DIR}"`, { encoding: "utf-8" });
+
+// Cross-platform directory size calculation
+function getDirSize(dirPath) {
+  let size = 0;
+  try {
+    const items = readdirSync(dirPath, { withFileTypes: true });
+    for (const item of items) {
+      const fullPath = path.join(dirPath, item.name);
+      if (item.isDirectory()) {
+        size += getDirSize(fullPath);
+      } else {
+        try {
+          size += statSync(fullPath).size;
+        } catch {
+          // Skip files that can't be accessed
+        }
+      }
+    }
+  } catch {
+    // Skip directories that can't be accessed
+  }
+  return size;
+}
+
+function formatBytes(bytes) {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`;
+}
+
+const totalSize = getDirSize(STAGING_DIR);
 console.log(`  Location: ${STAGING_DIR}`);
-console.log(`  Size: ${size.trim()}`);
+console.log(`  Size: ${formatBytes(totalSize)}`);

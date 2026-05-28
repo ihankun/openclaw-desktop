@@ -11,12 +11,13 @@
  *   Default version: v22.14.0 (LTS)
  */
 
-import { chmodSync, createWriteStream, existsSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, createWriteStream, cpSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { execSync } from "node:child_process";
 import { get } from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RESOURCES_DIR = path.resolve(__dirname, "..", "resources");
@@ -94,15 +95,30 @@ try {
   mkdirSync(NODE_DIR, { recursive: true });
 
   if (plat === "win") {
-    execSync(`unzip -o "${archivePath}" -d "${RESOURCES_DIR}"`, { stdio: "inherit" });
-    execSync(`mv "${RESOURCES_DIR}/${dirName}"/* "${NODE_DIR}"`, { stdio: "inherit" });
+    // Use PowerShell Expand-Archive on Windows
+    const psPath = archivePath.replace(/\\/g, '\\\\');
+    const psDest = RESOURCES_DIR.replace(/\\/g, '\\\\');
+    execSync(`powershell -Command "Expand-Archive -Path '${psPath}' -DestinationPath '${psDest}' -Force"`, { stdio: "inherit" });
+    
+    // Move contents from extracted dir to node dir
+    const extractedDir = path.join(RESOURCES_DIR, dirName);
+    const entries = readdirSync(extractedDir);
+    for (const entry of entries) {
+      cpSync(path.join(extractedDir, entry), path.join(NODE_DIR, entry), { recursive: true });
+    }
+    rmSync(extractedDir, { recursive: true });
   } else {
     execSync(`tar -xzf "${archivePath}" -C "${RESOURCES_DIR}"`, { stdio: "inherit" });
     execSync(`mv "${RESOURCES_DIR}/${dirName}"/* "${NODE_DIR}"`, { stdio: "inherit" });
   }
 
   rmSync(archivePath);
-  chmodSync(path.join(NODE_DIR, "bin", "node"), 0o755);
+  
+  // Set executable permissions (skip on Windows)
+  if (plat !== "win") {
+    chmodSync(path.join(NODE_DIR, "bin", "node"), 0o755);
+  }
+  
   await writeFile(VERSION_FILE, version);
 
   console.log(`Node.js ${version} ready at ${NODE_DIR}`);

@@ -53,6 +53,7 @@ let mainWindow = null;
 let appIcon = null;
 let gatewayStarting = false;
 let gatewayReady = false;
+let needsSetup = false; // Track if initialization is needed
 
 // ============================================================================
 // Path Resolution
@@ -80,6 +81,102 @@ function resolveTrayIcon() {
     if (fs.existsSync(p)) return p;
   }
   return undefined;
+}
+
+// ============================================================================
+// Initialization Check
+// ============================================================================
+
+const os = require("node:os");
+
+function checkNeedsSetup() {
+  try {
+    // Use os.homedir() for all platforms - matches OpenClaw core behavior
+    // Config is always at ~/.openclaw/openclaw.json
+    const homedir = os.homedir();
+    const stateDir = path.join(homedir, ".openclaw");
+    const configPath = path.join(stateDir, "openclaw.json");
+    const exists = fs.existsSync(configPath);
+    
+    log(`[setup-check] homedir: ${homedir}`);
+    log(`[setup-check] stateDir: ${stateDir}`);
+    log(`[setup-check] configPath: ${configPath}`);
+    log(`[setup-check] exists: ${exists}`);
+    
+    return !exists;
+  } catch (err) {
+    log("Error checking setup:", err.message);
+    return true; // Assume needs setup on error
+  }
+}
+
+function setupPageURL() {
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { margin:0; display:flex; align-items:center; justify-content:center;
+           height:100vh; font-family:-apple-system,BlinkMacSystemFont,sans-serif;
+           background:#1a1a2e; color:#e0e0e0; }
+    .container { text-align:center; max-width:600px; padding:40px; }
+    h1 { color:#6c63ff; margin-bottom:20px; }
+    p { color:#aaa; line-height:1.6; margin-bottom:30px; }
+    .btn { background:#6c63ff; color:white; border:none; padding:12px 30px;
+           border-radius:6px; cursor:pointer; font-size:16px; margin:10px; }
+    .btn:hover { background:#5a52d5; }
+    .btn-secondary { background:#333; }
+    .btn-secondary:hover { background:#444; }
+    .status { margin-top:20px; color:#888; font-size:14px; min-height:20px; }
+    .error { color:#ff6b6b; }
+    .success { color:#51cf66; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🦞 Welcome to OpenClaw</h1>
+    <p>OpenClaw needs to be set up before first use. This will create a configuration file and workspace directory.</p>
+    <div>
+      <button class="btn" id="setupBtn">Run Setup</button>
+      <button class="btn btn-secondary" id="quitBtn">Quit</button>
+    </div>
+    <div class="status" id="status"></div>
+  </div>
+  <script>
+    const statusEl = document.getElementById('status');
+    
+    document.getElementById('setupBtn').addEventListener('click', async () => {
+      document.getElementById('setupBtn').disabled = true;
+      statusEl.textContent = 'Running setup...';
+      statusEl.className = 'status';
+      
+      try {
+        const result = await window.electronAPI.runSetup();
+        if (result.success) {
+          statusEl.textContent = 'Setup complete! Starting gateway...';
+          statusEl.className = 'status success';
+          setTimeout(() => {
+            window.electronAPI.notifySetupComplete();
+          }, 1500);
+        } else {
+          statusEl.textContent = 'Setup failed: ' + (result.error || 'Unknown error');
+          statusEl.className = 'status error';
+          document.getElementById('setupBtn').disabled = false;
+        }
+      } catch (err) {
+        statusEl.textContent = 'Setup error: ' + err.message;
+        statusEl.className = 'status error';
+        document.getElementById('setupBtn').disabled = false;
+      }
+    });
+    
+    document.getElementById('quitBtn').addEventListener('click', () => {
+      window.electronAPI.quitApp();
+    });
+  </script>
+</body>
+</html>`;
+  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 }
 
 // ============================================================================
@@ -459,6 +556,72 @@ function setupIpcHandlers() {
     await shell.openExternal(url);
     return { success: true };
   });
+  
+  // Handle setup command
+  ipcMain.handle("run-setup", async () => {
+    try {
+      const entryPath = resolveOpenClawEntry();
+      const nodePath = resolveNodeBinary();
+      
+      if (!fs.existsSync(entryPath)) {
+        return { success: false, error: "openclaw.mjs not found" };
+      }
+      if (!nodePath) {
+        return { success: false, error: "Node.js not found" };
+      }
+      
+      const cwd = isDevelopment ? resolveProjectRoot() : path.join(process.resourcesPath, "gateway");
+      const env = { ...process.env, OPENCLAW_NO_RESPAWN: "1" };
+      
+      return await new Promise((resolve) => {
+        const setupProcess = spawn(nodePath, [entryPath, "setup"], {
+          cwd,
+          env,
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+        
+        let output = "";
+        let errorOutput = "";
+        
+        setupProcess.stdout.on("data", (data) => {
+          output += data.toString();
+          log("[setup]", data.toString().trim());
+        });
+        
+        setupProcess.stderr.on("data", (data) => {
+          errorOutput += data.toString();
+          log("[setup error]", data.toString().trim());
+        });
+        
+        setupProcess.on("close", (code) => {
+          if (code === 0) {
+            needsSetup = false;
+            resolve({ success: true });
+          } else {
+            resolve({ success: false, error: errorOutput || `Exit code: ${code}` });
+          }
+        });
+        
+        setupProcess.on("error", (err) => {
+          resolve({ success: false, error: err.message });
+        });
+      });
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  });
+  
+  // Handle setup completion
+  ipcMain.on("setup-complete", () => {
+    needsSetup = false;
+    startGateway();
+  });
+  
+  // Handle quit
+  ipcMain.on("quit-app", () => {
+    app.isQuitting = true;
+    app.quit();
+  });
 }
 
 // ============================================================================
@@ -469,8 +632,19 @@ async function onAppReady() {
   Menu.setApplicationMenu(createApplicationMenu());
   setupIpcHandlers();
   createTray();
+  
+  // Check if setup is needed
+  needsSetup = checkNeedsSetup();
+  
   createMainWindow();
-  startGateway();
+  
+  if (needsSetup) {
+    // Show setup page
+    mainWindow.loadURL(setupPageURL());
+  } else {
+    // Start gateway normally
+    startGateway();
+  }
 }
 
 app.whenReady().then(onAppReady);
