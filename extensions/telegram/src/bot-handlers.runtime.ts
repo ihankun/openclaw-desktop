@@ -30,6 +30,7 @@ import {
 import { isApprovalNotFoundError } from "openclaw/plugin-sdk/error-runtime";
 import { applyModelOverrideToSessionEntry } from "openclaw/plugin-sdk/model-session-runtime";
 import { formatModelsAvailableHeader } from "openclaw/plugin-sdk/models-provider-runtime";
+import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/number-runtime";
 import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
 import { resolveThreadSessionKeys } from "openclaw/plugin-sdk/routing";
 import { danger, logVerbose, warn } from "openclaw/plugin-sdk/runtime-env";
@@ -2051,7 +2052,9 @@ export const registerTelegramHandlers = ({
       const chatId = callbackMessage.chat.id;
       const isGroup =
         callbackMessage.chat.type === "group" || callbackMessage.chat.type === "supergroup";
-      const approvalCallback = parseExecApprovalCommandText(data);
+      const nativeCallbackCommand = parseTelegramNativeCommandCallbackData(data);
+      const callbackCommandText = nativeCallbackCommand ?? data;
+      const approvalCallback = parseExecApprovalCommandText(callbackCommandText);
       const isApprovalCallback = approvalCallback !== null;
       const inlineButtonsScope = resolveTelegramInlineButtonsScope({
         cfg,
@@ -2344,8 +2347,8 @@ export const registerTelegramHandlers = ({
           return;
         }
 
-        const page = Number.parseInt(pageValue, 10);
-        if (Number.isNaN(page) || page < 1) {
+        const page = parseStrictPositiveInteger(pageValue);
+        if (page === undefined) {
           return;
         }
 
@@ -2619,11 +2622,10 @@ export const registerTelegramHandlers = ({
         return;
       }
 
-      const nativeCallbackCommand = parseTelegramNativeCommandCallbackData(data);
       const syntheticMessage = buildSyntheticTextMessage({
         base: withResolvedTelegramForumFlag(callbackMessage, isForum),
         from: callback.from,
-        text: nativeCallbackCommand ?? data,
+        text: callbackCommandText,
       });
       const syntheticCtx = buildSyntheticContext(ctx, syntheticMessage);
       await processMessageWithReplyChain({

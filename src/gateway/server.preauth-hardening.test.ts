@@ -22,9 +22,11 @@ import { withTempConfig } from "./test-temp-config.js";
 
 installGatewayTestHooks({ scope: "suite" });
 
+await import("./server.js");
+
 const PREAUTH_HANDSHAKE_TEST_CLOSE_LIMIT_MS = 5_000;
 
-let cleanupEnv: Array<() => void> = [];
+const cleanupEnv: Array<() => void> = [];
 
 afterEach(async () => {
   while (cleanupEnv.length > 0) {

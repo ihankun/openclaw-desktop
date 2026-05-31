@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { ContentBlock, SessionUpdate } from "@agentclientprotocol/sdk";
+import { resolveIntegerOption } from "@openclaw/acp-core/numeric-options";
 import { resolveStateDir } from "../config/paths.js";
 import { withFileLock } from "../infra/file-lock.js";
 import { readJsonFile, writeTextAtomic } from "../infra/json-files.js";
@@ -103,14 +104,16 @@ function createEmptyStore(): LedgerStore {
 
 function normalizeLedgerOptions(options: LedgerOptions = {}) {
   return {
-    maxSessions: Math.max(1, Math.floor(options.maxSessions ?? DEFAULT_MAX_SESSIONS)),
-    maxEventsPerSession: Math.max(
-      1,
-      Math.floor(options.maxEventsPerSession ?? DEFAULT_MAX_EVENTS_PER_SESSION),
+    maxSessions: resolveIntegerOption(options.maxSessions, DEFAULT_MAX_SESSIONS, { min: 1 }),
+    maxEventsPerSession: resolveIntegerOption(
+      options.maxEventsPerSession,
+      DEFAULT_MAX_EVENTS_PER_SESSION,
+      { min: 1 },
     ),
-    maxSerializedBytes: Math.max(
-      1_024,
-      Math.floor(options.maxSerializedBytes ?? DEFAULT_MAX_SERIALIZED_BYTES),
+    maxSerializedBytes: resolveIntegerOption(
+      options.maxSerializedBytes,
+      DEFAULT_MAX_SERIALIZED_BYTES,
+      { min: 1_024 },
     ),
     now: options.now ?? Date.now,
   };

@@ -6,6 +6,8 @@ import {
   createChatSessionsLoadOverrides,
   hasAbortableSessionRun,
   refreshChat,
+  scopedAgentListParamsForSession,
+  scopedAgentParamsForSession,
 } from "./app-chat.ts";
 import { DEFAULT_CRON_FORM } from "./app-defaults.ts";
 import { renderUsageTab } from "./app-render-usage-tab.ts";
@@ -22,9 +24,14 @@ import {
   dismissChatError,
   switchChatSession,
 } from "./app-render.helpers.ts";
-import { warnQueryToken } from "./app-settings.ts";
+import { hasOperatorWriteAccess, warnQueryToken } from "./app-settings.ts";
 import type { AppViewState } from "./app-view-state.ts";
 import { reconcileChatRunLifecycle } from "./chat/run-lifecycle.ts";
+import {
+  resolveChatAgentFilterId,
+  resolveChatAgentFilterOptions,
+  resolvePreferredSessionForAgent,
+} from "./chat/session-controls.ts";
 import {
   controlUiNowMs,
   recordControlUiRenderTiming,
@@ -59,6 +66,7 @@ import {
   updateConfigRawValue,
   updateConfigFormValue,
   removeConfigFormValue,
+  updateMcpServerEnabled,
 } from "./controllers/config.ts";
 import {
   loadCronJobsPage,
@@ -113,6 +121,7 @@ import {
   branchSessionFromCheckpoint,
   deleteSessionsAndRefresh,
   loadSessions,
+  parseSessionsFilterInteger,
   patchSession,
   restoreSessionFromCheckpoint,
   toggleSessionCompactionCheckpoints,
@@ -130,8 +139,10 @@ import {
   updateSkillEdit,
   updateSkillEnabled,
 } from "./controllers/skills.ts";
+import { captureSessionToWorkboard, getWorkboardState } from "./controllers/workboard.ts";
 import { getCronJobPayload } from "./cron-payload.ts";
 import { buildExternalLinkRel, EXTERNAL_LINK_TARGET } from "./external-link.ts";
+import { formatTimeMs } from "./format.ts";
 import { formatRelativeTimestamp } from "./format.ts";
 import { icons } from "./icons.ts";
 import { createLazyView, renderLazyView } from "./lazy-view.ts";
@@ -151,7 +162,9 @@ import { isCronSessionKey, resolveSessionDisplayName } from "./session-display.t
 import "./components/dashboard-header.ts";
 import {
   buildAgentMainSessionKey,
+  isSessionKeyTiedToAgent,
   isSubagentSessionKey,
+  normalizeAgentId,
   parseAgentSessionKey,
   resolveAgentIdFromSessionKey,
 } from "./session-key.ts";
@@ -183,6 +196,7 @@ import { renderDreaming } from "./views/dreaming.ts";
 import { renderExecApprovalPrompt } from "./views/exec-approval.ts";
 import { renderGatewayUrlConfirmation } from "./views/gateway-url-confirmation.ts";
 import { renderLoginGate } from "./views/login-gate.ts";
+import { renderMcp } from "./views/mcp.ts";
 import { renderOverview } from "./views/overview.ts";
 
 let pendingUpdate: (() => void) | undefined;
@@ -248,7 +262,40 @@ function isSidebarSessionBusy(state: AppViewState) {
   );
 }
 
+function resolveSidebarDefaultAgentId(state: AppViewState): string {
+  const snapshot = state.hello?.snapshot as
+    | { sessionDefaults?: { defaultAgentId?: string } }
+    | undefined;
+  return normalizeAgentId(
+    state.agentsList?.defaultId ?? snapshot?.sessionDefaults?.defaultAgentId ?? "main",
+  );
+}
+
+function resolveSidebarSelectedAgentId(state: AppViewState): string {
+  const parsed = parseAgentSessionKey(state.sessionKey);
+  if (parsed) {
+    return normalizeAgentId(parsed.agentId);
+  }
+  const sessionKey = normalizeOptionalString(state.sessionKey)?.toLowerCase();
+  const fallbackAgentId =
+    sessionKey === "global" || sessionKey === "unknown"
+      ? (state.assistantAgentId ?? resolveSidebarDefaultAgentId(state))
+      : resolveSidebarDefaultAgentId(state);
+  return normalizeAgentId(fallbackAgentId);
+}
+
+function isSidebarSessionForSelectedAgent(
+  state: AppViewState,
+  row: GatewaySessionRow,
+  selectedAgentId: string,
+): boolean {
+  return isSessionKeyTiedToAgent(row.key, selectedAgentId, resolveSidebarDefaultAgentId(state));
+}
+
 function resolveSidebarRecentSessions(state: AppViewState): GatewaySessionRow[] {
+  const selectedAgentId = resolveSidebarSelectedAgentId(state);
+  const shouldFilterByAgent =
+    normalizeOptionalString(state.sessionKey)?.toLowerCase() !== "unknown";
   return (state.sessionsResult?.sessions ?? [])
     .filter(
       (row) =>
@@ -258,7 +305,8 @@ function resolveSidebarRecentSessions(state: AppViewState): GatewaySessionRow[] 
         row.kind !== "cron" &&
         !isCronSessionKey(row.key) &&
         !isSubagentSessionKey(row.key) &&
-        !row.spawnedBy,
+        !row.spawnedBy &&
+        (!shouldFilterByAgent || isSidebarSessionForSelectedAgent(state, row, selectedAgentId)),
     )
     .toSorted((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
     .slice(0, 5);
@@ -302,8 +350,28 @@ function renderSidebarSessions(state: AppViewState) {
       ${collapsed || recent.length === 0
         ? nothing
         : html`
-            <div class="sidebar-recent-sessions" aria-label=${t("overview.cards.recentSessions")}>
-              <div class="sidebar-recent-sessions__label">${t("usage.sessions.recentShort")}</div>
+            <div
+              class="sidebar-recent-sessions ${state.settings.recentSessionsCollapsed
+                ? "sidebar-recent-sessions--collapsed"
+                : ""}"
+              aria-label=${t("overview.cards.recentSessions")}
+            >
+              <button
+                class="sidebar-recent-sessions__label"
+                type="button"
+                aria-expanded=${String(!state.settings.recentSessionsCollapsed)}
+                @click=${() => {
+                  state.applySettings({
+                    ...state.settings,
+                    recentSessionsCollapsed: !state.settings.recentSessionsCollapsed,
+                  });
+                }}
+              >
+                <span class="sidebar-recent-sessions__label-text"
+                  >${t("usage.sessions.recentShort")}</span
+                >
+                <span class="sidebar-recent-sessions__chevron"> ${icons.chevronDown} </span>
+              </button>
               <div class="sidebar-recent-sessions__list">
                 ${recent.map((row) => renderSidebarRecentSession(state, row))}
               </div>
@@ -368,15 +436,19 @@ const lazyLogs = createLazyView(() => import("./views/logs.ts"), notifyLazyViewC
 const lazyNodes = createLazyView(() => import("./views/nodes.ts"), notifyLazyViewChanged);
 const lazySessions = createLazyView(() => import("./views/sessions.ts"), notifyLazyViewChanged);
 const lazySkills = createLazyView(() => import("./views/skills.ts"), notifyLazyViewChanged);
+const lazyWorkboard = createLazyView(() => import("./views/workboard.ts"), notifyLazyViewChanged);
 
-function formatDreamNextCycle(nextRunAtMs: number | undefined): string | null {
-  if (typeof nextRunAtMs !== "number" || !Number.isFinite(nextRunAtMs)) {
-    return null;
-  }
-  return new Date(nextRunAtMs).toLocaleTimeString([], {
-    hour: "numeric",
-    minute: "2-digit",
-  });
+export function formatDreamNextCycle(nextRunAtMs: number | undefined): string | null {
+  return (
+    formatTimeMs(
+      nextRunAtMs,
+      {
+        hour: "numeric",
+        minute: "2-digit",
+      },
+      "",
+    ) || null
+  );
 }
 
 function resolveDreamingNextCycle(
@@ -913,6 +985,8 @@ export function renderApp(state: AppViewState) {
   const cronNext = state.cronStatus?.nextWakeAtMs ?? null;
   const chatDisabledReason = state.connected ? null : t("chat.disconnected");
   const isChat = state.tab === "chat";
+  const headerError = !isChat && state.lastError !== state.chatError ? state.lastError : null;
+  const chatViewError = state.lastError;
   const chatFocus = isChat && (state.settings.chatFocusMode || state.onboarding);
   const chatHeaderHidden = isChat && (chatFocus || state.chatHeaderControlsHidden);
   const navDrawerOpen = state.navDrawerOpen && !chatFocus && !state.onboarding;
@@ -963,10 +1037,16 @@ export function renderApp(state: AppViewState) {
   const configuredDreaming = resolveConfiguredDreaming(configValue);
   const dreamingOn = state.dreamingStatus?.enabled ?? configuredDreaming.enabled;
   const dreamingNextCycle = resolveDreamingNextCycle(state.dreamingStatus);
+  const dreamingAgentOptions = resolveChatAgentFilterOptions(state);
+  const dreamingSelectedAgentId = resolveChatAgentFilterId(state, state.sessionKey);
+  const syncDreamingSelectedAgent = () => {
+    state.selectedAgentId = dreamingSelectedAgentId;
+  };
   const dreamingLoading = state.dreamingStatusLoading || state.dreamingModeSaving;
   const dreamingRefreshLoading = state.dreamingStatusLoading || state.dreamDiaryLoading;
   const refreshDreaming = () => {
     void (async () => {
+      syncDreamingSelectedAgent();
       await loadConfig(state);
       await Promise.all([
         loadDreamingStatus(state),
@@ -1202,8 +1282,8 @@ export function renderApp(state: AppViewState) {
     configPath: state.configSnapshot?.path ?? null,
     rawAvailable:
       typeof state.configSnapshot?.raw === "string" ||
-      !!state.configSnapshot?.config ||
-      !!state.configForm,
+      Boolean(state.configSnapshot?.config) ||
+      Boolean(state.configForm),
   } satisfies Omit<
     ConfigProps,
     | "formMode"
@@ -1340,8 +1420,7 @@ export function renderApp(state: AppViewState) {
               state.setTab("skills");
             },
             onConfigureMcp: () => {
-              state.infrastructureActiveSection = "mcp";
-              state.setTab("infrastructure");
+              state.setTab("mcp");
             },
             security: extractQuickSettingsSecurity(state),
             onSecurityConfigure: () => {
@@ -1559,6 +1638,37 @@ export function renderApp(state: AppViewState) {
           navRootLabel: "Automation",
           includeSections: [...AUTOMATION_SECTION_KEYS],
         });
+      case "mcp":
+        return renderMcp({
+          configObject:
+            state.configForm ??
+            ((state.configSnapshot?.config as Record<string, unknown> | null) || {}),
+          configDirty: state.configFormDirty,
+          configSaving: state.configSaving,
+          configApplying: state.configApplying,
+          connected: state.connected,
+          onSaveConfig: () => saveConfig(state),
+          onApplyConfig: () => applyConfig(state),
+          onServerEnabledChange: (name, enabled) => {
+            updateMcpServerEnabled(state, name, enabled);
+            requestHostUpdate?.();
+          },
+          editor: renderConfigTab({
+            formMode: "form",
+            searchQuery: "",
+            activeSection: "mcp",
+            activeSubsection: null,
+            onFormModeChange: () => undefined,
+            onSearchChange: () => undefined,
+            onSectionChange: () => {
+              state.infrastructureActiveSection = "mcp";
+              state.infrastructureActiveSubsection = null;
+            },
+            onSubsectionChange: (section) => (state.infrastructureActiveSubsection = section),
+            navRootLabel: "MCP",
+            includeSections: ["mcp"],
+          }),
+        });
       case "infrastructure":
         return renderConfigTab({
           formMode: state.infrastructureFormMode,
@@ -1609,11 +1719,9 @@ export function renderApp(state: AppViewState) {
       case "tools":
         void loadToolsCatalog(state, agentId);
         void refreshVisibleToolsEffectiveForCurrentSession(state);
-        return;
       case "overview":
       case "channels":
       case "cron":
-        return;
     }
   };
   const refreshAgentsPanelSupplementalData = (panel: AppViewState["agentsPanel"]) => {
@@ -1846,7 +1954,7 @@ export function renderApp(state: AppViewState) {
       <main
         class="content ${isChat ? "content--chat" : ""} ${state.tab === "logs"
           ? "content--logs"
-          : ""}"
+          : ""} ${state.tab === "workboard" ? "content--workboard" : ""}"
       >
         ${state.updateStatusBanner
           ? html`<div class="callout ${state.updateStatusBanner.tone}" role="alert">
@@ -1923,9 +2031,7 @@ export function renderApp(state: AppViewState) {
                       </div>
                     `
                   : nothing}
-                ${state.lastError
-                  ? html`<div class="pill danger">${state.lastError}</div>`
-                  : nothing}
+                ${headerError ? html`<div class="pill danger">${headerError}</div>` : nothing}
                 ${isChat ? renderChatControls(state) : nothing}
               </div>
             </section>`}
@@ -2032,8 +2138,20 @@ export function renderApp(state: AppViewState) {
             )
           : nothing}
         ${state.tab === "sessions"
-          ? renderLazyView(lazySessions, (m) =>
-              m.renderSessions({
+          ? renderLazyView(lazySessions, (m) => {
+              const workboardState = getWorkboardState(state);
+              const workboardEnabled = isPluginEnabledInConfigSnapshot(
+                state.configSnapshot,
+                "workboard",
+                {
+                  enabledByDefault: false,
+                },
+              );
+              const operatorCanWrite = hasOperatorWriteAccess(
+                (state.hello as { auth?: { role?: string; scopes?: string[] } } | null)?.auth ??
+                  null,
+              );
+              return m.renderSessions({
                 loading: state.sessionsLoading,
                 result: state.sessionsResult,
                 error: state.sessionsError,
@@ -2051,6 +2169,12 @@ export function renderApp(state: AppViewState) {
                 page: state.sessionsPage,
                 pageSize: state.sessionsPageSize,
                 selectedKeys: state.sessionsSelectedKeys,
+                workboardSessionKeys: new Set(
+                  workboardState.cards
+                    .flatMap((card) => [card.sessionKey, card.execution?.sessionKey])
+                    .filter((key): key is string => typeof key === "string" && key.length > 0),
+                ),
+                workboardBusySessionKey: [...workboardState.capturingSessionKeys][0] ?? null,
                 expandedCheckpointKey: state.sessionsExpandedCheckpointKey,
                 checkpointItemsByKey: state.sessionsCheckpointItemsByKey,
                 checkpointLoadingKey: state.sessionsCheckpointLoadingKey,
@@ -2065,8 +2189,8 @@ export function renderApp(state: AppViewState) {
                   state.sessionsSelectedKeys = new Set();
                   state.sessionsPage = 0;
                   void loadSessions(state, {
-                    activeMinutes: Number(next.activeMinutes) || 0,
-                    limit: Number(next.limit) || 0,
+                    activeMinutes: parseSessionsFilterInteger(next.activeMinutes),
+                    limit: parseSessionsFilterInteger(next.limit),
                     includeGlobal: next.includeGlobal,
                     includeUnknown: next.includeUnknown,
                     showArchived: next.showArchived,
@@ -2151,6 +2275,18 @@ export function renderApp(state: AppViewState) {
                   switchChatSession(state, sessionKey);
                   state.setTab("chat" as import("./navigation.ts").Tab);
                 },
+                onAddToWorkboard:
+                  workboardEnabled && operatorCanWrite
+                    ? async (session) => {
+                        await captureSessionToWorkboard({
+                          host: state,
+                          client: state.client,
+                          session,
+                          requestUpdate: requestHostUpdate,
+                        });
+                        state.setTab("workboard" as import("./navigation.ts").Tab);
+                      }
+                    : undefined,
                 onToggleCheckpointDetails: (sessionKey) =>
                   toggleSessionCompactionCheckpoints(state, sessionKey),
                 onBranchFromCheckpoint: async (sessionKey, checkpointId) => {
@@ -2166,6 +2302,29 @@ export function renderApp(state: AppViewState) {
                 },
                 onRestoreCheckpoint: (sessionKey, checkpointId) =>
                   restoreSessionFromCheckpoint(state, sessionKey, checkpointId),
+              });
+            })
+          : nothing}
+        ${state.tab === "workboard"
+          ? renderLazyView(lazyWorkboard, (m) =>
+              m.renderWorkboard({
+                host: state,
+                client: state.client,
+                connected: state.connected,
+                canWrite: hasOperatorWriteAccess(
+                  (state.hello as { auth?: { role?: string; scopes?: string[] } } | null)?.auth ??
+                    null,
+                ),
+                pluginEnabled: isPluginEnabledInConfigSnapshot(state.configSnapshot, "workboard", {
+                  enabledByDefault: false,
+                }),
+                agentsList: state.agentsList,
+                sessions: state.sessionsResult?.sessions ?? [],
+                onOpenSession: (sessionKey) => {
+                  switchChatSession(state, sessionKey);
+                  state.setTab("chat" as import("./navigation.ts").Tab);
+                },
+                onRequestUpdate: requestHostUpdate,
               }),
             )
           : nothing}
@@ -2260,16 +2419,18 @@ export function renderApp(state: AppViewState) {
                   updateCronRunsFilter(state, { cronRunsScope: "job" });
                   await loadCronRuns(state, jobId);
                 },
-                onLoadMoreJobs: () => loadCronJobsPage(state, { append: true }),
+                onLoadMoreJobs: () => loadCronJobsPage(state, { append: true, tableFilters: true }),
                 onJobsFiltersChange: async (patch) => {
                   updateCronJobsFilter(state, patch);
                   const shouldReload =
                     typeof patch.cronJobsQuery === "string" ||
                     Boolean(patch.cronJobsEnabledFilter) ||
+                    Boolean(patch.cronJobsScheduleKindFilter) ||
+                    Boolean(patch.cronJobsLastStatusFilter) ||
                     Boolean(patch.cronJobsSortBy) ||
                     Boolean(patch.cronJobsSortDir);
                   if (shouldReload) {
-                    await loadCronJobsPage(state, { append: false });
+                    await loadCronJobsPage(state, { append: false, tableFilters: true });
                   }
                 },
                 onJobsFiltersReset: async () => {
@@ -2281,7 +2442,7 @@ export function renderApp(state: AppViewState) {
                     cronJobsSortBy: "nextRunAtMs",
                     cronJobsSortDir: "asc",
                   });
-                  await loadCronJobsPage(state, { append: false });
+                  await loadCronJobsPage(state, { append: false, tableFilters: true });
                 },
                 onLoadMoreRuns: () => loadMoreCronRuns(state),
                 onRunsFiltersChange: async (patch) => {
@@ -2541,17 +2702,15 @@ export function renderApp(state: AppViewState) {
                   const { basePath, existing } = modelEntry;
                   if (!modelId) {
                     removeConfigFormValue(state, basePath);
+                  } else if (existing && typeof existing === "object" && !Array.isArray(existing)) {
+                    const fallbacks = (existing as { fallbacks?: unknown }).fallbacks;
+                    const next = {
+                      primary: modelId,
+                      ...(Array.isArray(fallbacks) ? { fallbacks } : {}),
+                    };
+                    updateConfigFormValue(state, basePath, next);
                   } else {
-                    if (existing && typeof existing === "object" && !Array.isArray(existing)) {
-                      const fallbacks = (existing as { fallbacks?: unknown }).fallbacks;
-                      const next = {
-                        primary: modelId,
-                        ...(Array.isArray(fallbacks) ? { fallbacks } : {}),
-                      };
-                      updateConfigFormValue(state, basePath, next);
-                    } else {
-                      updateConfigFormValue(state, basePath, modelId);
-                    }
+                    updateConfigFormValue(state, basePath, modelId);
                   }
                   void refreshVisibleToolsEffectiveForCurrentSession(state);
                 },
@@ -2793,7 +2952,7 @@ export function renderApp(state: AppViewState) {
                   connected: state.connected,
                   canSend: state.connected,
                   disabledReason: chatDisabledReason,
-                  error: state.lastError,
+                  error: chatViewError,
                   runStatus: state.chatRunStatus,
                   onDismissError: () => dismissChatError(state),
                   sessions: state.sessionsResult,
@@ -2827,6 +2986,7 @@ export function renderApp(state: AppViewState) {
                     state.setTab("sessions" as import("./navigation.ts").Tab);
                     void loadSessions(state, {
                       ...createChatSessionsLoadOverrides(state),
+                      ...scopedAgentListParamsForSession(state, state.sessionKey),
                     });
                   },
                   onToggleRealtimeTalk: () => state.toggleRealtimeTalk(),
@@ -2837,6 +2997,7 @@ export function renderApp(state: AppViewState) {
                   canAbort: hasAbortableSessionRun(state),
                   onAbort: () => void state.handleAbortChat({ preserveDraft: true }),
                   onQueueRemove: (id) => state.removeQueuedMessage(id),
+                  onQueueRetry: (id) => void state.retryQueuedChatMessage(id),
                   onQueueSteer: (id) => void state.steerQueuedChatMessage(id),
                   onDismissSideResult: () => {
                     state.chatSideResult = null;
@@ -2848,7 +3009,10 @@ export function renderApp(state: AppViewState) {
                     }
                     const hadActiveRun = hasAbortableSessionRun(state);
                     try {
-                      await state.client.request("sessions.reset", { key: state.sessionKey });
+                      await state.client.request("sessions.reset", {
+                        key: state.sessionKey,
+                        ...scopedAgentParamsForSession(state, state.sessionKey),
+                      });
                       state.chatMessages = [];
                       state.chatSideResult = null;
                       reconcileChatRunLifecycle(
@@ -2868,10 +3032,12 @@ export function renderApp(state: AppViewState) {
                       await loadChatHistory(state);
                     } catch (err) {
                       state.lastError = String(err);
+                      state.chatError = state.lastError;
                     }
                   },
                   agentsList: state.agentsList,
                   currentAgentId: resolvedAgentId ?? "main",
+                  fullMessageAgentId: scopedAgentParamsForSession(state, state.sessionKey).agentId,
                   onAgentChange: (agentId: string) => {
                     switchChatSession(state, buildAgentMainSessionKey({ agentId }));
                   },
@@ -2960,6 +3126,8 @@ export function renderApp(state: AppViewState) {
         ${state.tab === "dreams"
           ? renderDreaming({
               active: dreamingOn,
+              selectedAgentId: dreamingSelectedAgentId,
+              agentOptions: dreamingAgentOptions,
               shortTermCount: state.dreamingStatus?.shortTermCount ?? 0,
               groundedSignalCount: state.dreamingStatus?.groundedSignalCount ?? 0,
               totalSignalCount: state.dreamingStatus?.totalSignalCount ?? 0,
@@ -2992,7 +3160,16 @@ export function renderApp(state: AppViewState) {
               wikiMemoryPalaceError: state.wikiMemoryPalaceError,
               wikiMemoryPalace: state.wikiMemoryPalace,
               onRefresh: refreshDreaming,
-              onRefreshDiary: () => loadDreamDiary(state),
+              onSelectAgent: (agentId: string) => {
+                state.selectedAgentId = agentId;
+                switchChatSession(state, resolvePreferredSessionForAgent(state, agentId));
+                void loadDreamingStatus(state);
+                void loadDreamDiary(state);
+              },
+              onRefreshDiary: () => {
+                syncDreamingSelectedAgent();
+                void loadDreamDiary(state);
+              },
               onRefreshImports: () => {
                 void (async () => {
                   await loadConfig(state);
@@ -3007,14 +3184,29 @@ export function renderApp(state: AppViewState) {
               },
               onOpenConfig: () => openConfigFile(state),
               onOpenWikiPage: (lookup: string) => openWikiPage(lookup),
-              onBackfillDiary: () => backfillDreamDiary(state),
+              onBackfillDiary: () => {
+                syncDreamingSelectedAgent();
+                void backfillDreamDiary(state);
+              },
               onCopyDreamingArchivePath: () => {
                 void copyDreamingArchivePath(state);
               },
-              onDedupeDreamDiary: () => dedupeDreamDiary(state),
-              onResetDiary: () => resetDreamDiary(state),
-              onResetGroundedShortTerm: () => resetGroundedShortTerm(state),
-              onRepairDreamingArtifacts: () => repairDreamingArtifacts(state),
+              onDedupeDreamDiary: () => {
+                syncDreamingSelectedAgent();
+                void dedupeDreamDiary(state);
+              },
+              onResetDiary: () => {
+                syncDreamingSelectedAgent();
+                void resetDreamDiary(state);
+              },
+              onResetGroundedShortTerm: () => {
+                syncDreamingSelectedAgent();
+                void resetGroundedShortTerm(state);
+              },
+              onRepairDreamingArtifacts: () => {
+                syncDreamingSelectedAgent();
+                void repairDreamingArtifacts(state);
+              },
               onRequestUpdate: requestHostUpdate,
             })
           : nothing}

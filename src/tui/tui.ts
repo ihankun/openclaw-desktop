@@ -12,10 +12,11 @@ import {
   Text,
   TUI,
 } from "@earendil-works/pi-tui";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import type { CommandEntry } from "../../packages/gateway-protocol/src/index.js";
 import { resolveAgentIdByWorkspacePath, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { getRuntimeConfig, type OpenClawConfig } from "../config/config.js";
 import { isChatStopCommandText } from "../gateway/chat-abort.js";
-import type { CommandEntry } from "../gateway/protocol/index.js";
 import { registerUncaughtExceptionHandler } from "../infra/unhandled-rejections.js";
 import { setConsoleSubsystemFilter } from "../logging/console.js";
 import { loggingState } from "../logging/state.js";
@@ -25,7 +26,6 @@ import {
   normalizeMainKey,
   parseAgentSessionKey,
 } from "../routing/session-key.js";
-import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
 import { getSlashCommands } from "./commands.js";
 import { ChatLog } from "./components/chat-log.js";
 import { CustomEditor } from "./components/custom-editor.js";
@@ -35,7 +35,7 @@ import { editorTheme, theme } from "./theme/theme.js";
 import type { TuiBackend } from "./tui-backend.js";
 import { createCommandHandlers } from "./tui-command-handlers.js";
 import { createEventHandlers } from "./tui-event-handlers.js";
-import { formatTokens } from "./tui-formatters.js";
+import { formatGoalFooter, formatTokens } from "./tui-formatters.js";
 import {
   buildTuiLastSessionScopeKey,
   readTuiLastSessionKey,
@@ -78,7 +78,7 @@ const OPENCLAW_DIST_ENTRY_MJS_PATH = fileURLToPath(
   new URL("../../dist/entry.mjs", import.meta.url),
 );
 
-const OPENAI_CODEX_PROVIDER = "openai-codex";
+const OPENAI_CODEX_PROVIDER = "openai";
 
 type RunTuiOptions = TuiOptions & {
   backend?: TuiBackend;
@@ -476,9 +476,16 @@ export function resolveTuiCtrlCAction(params: {
   return resolveCtrlCAction(params);
 }
 
+function resolveEmptySessionInfoDefaults(config: OpenClawConfig): SessionInfo {
+  return {
+    verboseLevel: config.agents?.defaults?.verboseDefault,
+  };
+}
+
 export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
   const isLocalMode = opts.local === true || opts.backend !== undefined;
   const config = opts.config ?? getRuntimeConfig({ skipPluginValidation: !isLocalMode });
+  const emptySessionInfoDefaults = resolveEmptySessionInfoDefaults(config);
   const initialSessionInput = (opts.session ?? "").trim();
   let sessionScope: SessionScope = (config.session?.scope ?? "per-sender") as SessionScope;
   let sessionMainKey = normalizeMainKey(config.session?.mainKey);
@@ -510,7 +517,7 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
   const deliverDefault = opts.deliver ?? false;
   const autoMessage = opts.message?.trim();
   let autoMessageSent = false;
-  let sessionInfo: SessionInfo = {};
+  let sessionInfo: SessionInfo = { ...emptySessionInfoDefaults };
   let dynamicSlashCommands: CommandEntry[] = [];
   let dynamicSlashCommandsKey: string | null = null;
   let dynamicSlashCommandsInFlightKey: string | null = null;
@@ -1164,6 +1171,7 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
       `agent ${agentLabel}`,
       `session ${sessionLabel}`,
       modelLabel,
+      formatGoalFooter(sessionInfo.goal),
       think !== "off" ? `think ${think}` : null,
       fast ? "fast" : null,
       verbose !== "off" ? `verbose ${verbose}` : null,
@@ -1208,13 +1216,16 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
     setActivityStatus,
     clearLocalRunIds,
     rememberSessionKey: rememberCurrentSessionKey,
+    emptySessionInfoDefaults,
   });
   const {
     refreshAgents,
     refreshSessionInfo,
     applySessionInfoFromPatch,
+    applySessionMutationResult,
     loadHistory,
     setSession,
+    setEmptySession,
     abortActive,
   } = sessionActions;
 
@@ -1224,6 +1235,8 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
     handleBtwEvent,
     pauseStreamingWatchdog,
     reconnectStreamingWatchdog,
+    consumeCompletedRunForPendingSend,
+    flushPendingHistoryRefreshIfIdle,
   } = createEventHandlers({
     chatLog,
     btw,
@@ -1303,8 +1316,10 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
       closeOverlay,
       refreshSessionInfo,
       applySessionInfoFromPatch,
+      applySessionMutationResult,
       loadHistory,
       setSession,
+      setEmptySession,
       refreshAgents,
       abortActive,
       setActivityStatus,
@@ -1313,6 +1328,8 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
       noteLocalBtwRunId,
       forgetLocalRunId,
       forgetLocalBtwRunId,
+      consumeCompletedRunForPendingSend,
+      flushPendingHistoryRefreshIfIdle,
       runAuthFlow,
       requestExit,
     });

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { validateCronAddParams, validateCronUpdateParams } from "../gateway/protocol/index.js";
+import {
+  validateCronAddParams,
+  validateCronUpdateParams,
+} from "../../packages/gateway-protocol/src/index.js";
 import { normalizeCronJobCreate, normalizeCronJobPatch } from "./normalize.js";
 import { DEFAULT_TOP_OF_HOUR_STAGGER_MS } from "./stagger.js";
 
@@ -208,6 +211,17 @@ describe("normalizeCronJobCreate", () => {
     expectNormalizedAtSchedule({ kind: "at", atMs: "2026-01-12T18:00:00" });
   });
 
+  it("keeps out-of-range numeric schedule.atMs invalid instead of throwing for create jobs", () => {
+    const normalized = normalizeMainSystemEventCreateJob({
+      name: "out-of-range-at-ms",
+      schedule: { kind: "at", atMs: 8_640_000_000_000_001 },
+    });
+
+    const schedule = normalized.schedule as Record<string, unknown>;
+    expect(schedule).toEqual({ kind: "at" });
+    expect(validateCronAddParams(normalized)).toBe(false);
+  });
+
   it("migrates legacy schedule.cron into schedule.expr", () => {
     const normalized = normalizeMainSystemEventCreateJob({
       name: "legacy-cron-field",
@@ -342,6 +356,31 @@ describe("normalizeCronJobCreate", () => {
     const delivery = normalized.delivery as Record<string, unknown>;
     expect(delivery.mode).toBe("webhook");
     expect(delivery.to).toBe("https://example.invalid/cron");
+  });
+
+  it("preserves invalid completion webhook create shapes for validation", () => {
+    const normalized = normalizeCronJobCreate({
+      name: "completion without announce",
+      enabled: true,
+      schedule: { kind: "every", everyMs: 60_000 },
+      sessionTarget: "main",
+      wakeMode: "now",
+      payload: { kind: "systemEvent", text: "hello" },
+      delivery: {
+        mode: "none",
+        completionDestination: {
+          mode: " WeBhOoK ",
+          to: " https://example.invalid/complete ",
+        },
+      },
+    }) as unknown as Record<string, unknown>;
+
+    const delivery = normalized.delivery as Record<string, unknown>;
+    expect(delivery.completionDestination).toEqual({
+      mode: "webhook",
+      to: "https://example.invalid/complete",
+    });
+    expect(validateCronAddParams(normalized)).toBe(false);
   });
 
   it("does not default explicit mode-less delivery objects to announce", () => {
@@ -526,6 +565,23 @@ describe("normalizeCronJobCreate", () => {
     expect(payload.timeoutSeconds).toBe(0.03);
   });
 
+  it("drops negative agentTurn timeoutSeconds instead of converting it to no-timeout", () => {
+    const nested = normalizeCronJobCreate({
+      name: "negative nested timeout",
+      schedule: { kind: "every", everyMs: 60_000 },
+      payload: { kind: "agentTurn", message: "hello", timeoutSeconds: -5 },
+    }) as unknown as Record<string, unknown>;
+    const flattened = normalizeCronJobCreate({
+      name: "negative flat timeout",
+      schedule: { kind: "every", everyMs: 60_000 },
+      payload: { kind: "agentTurn", message: "hello" },
+      timeoutSeconds: -5,
+    }) as unknown as Record<string, unknown>;
+
+    expect(nested.payload).not.toHaveProperty("timeoutSeconds");
+    expect(flattened.payload).not.toHaveProperty("timeoutSeconds");
+  });
+
   it("preserves empty toolsAllow lists for create jobs", () => {
     const normalized = normalizeCronJobCreate({
       name: "empty-tools",
@@ -618,6 +674,74 @@ describe("normalizeCronJobCreate", () => {
       everyMs: 60_000,
     });
     expect(validateCronAddParams(normalized)).toBe(true);
+  });
+
+  it("normalizes string every schedule numbers for create jobs", () => {
+    const normalized = normalizeCronJobCreate({
+      name: "every-string",
+      schedule: {
+        everyMs: "60000",
+        anchorMs: "123.9",
+      },
+      sessionTarget: "main",
+      wakeMode: "next-heartbeat",
+      payload: {
+        kind: "systemEvent",
+        text: "hi",
+      },
+    }) as unknown as Record<string, unknown>;
+
+    const schedule = normalized.schedule as Record<string, unknown>;
+    expect(schedule).toEqual({
+      kind: "every",
+      everyMs: 60_000,
+      anchorMs: 123,
+    });
+    expect(validateCronAddParams(normalized)).toBe(true);
+  });
+
+  it("normalizes string every schedule numbers for patches", () => {
+    const normalized = normalizeCronJobPatch({
+      schedule: {
+        kind: "every",
+        everyMs: "60000",
+        anchorMs: "123.9",
+      },
+    }) as unknown as Record<string, unknown>;
+
+    const schedule = normalized.schedule as Record<string, unknown>;
+    expect(schedule).toEqual({
+      kind: "every",
+      everyMs: 60_000,
+      anchorMs: 123,
+    });
+    expect(validateCronUpdateParams({ id: "job", patch: normalized })).toBe(true);
+  });
+
+  it("keeps invalid every schedule numbers invalid for validation", () => {
+    const zeroEvery = normalizeCronJobCreate({
+      name: "every-zero",
+      schedule: {
+        kind: "every",
+        everyMs: "0",
+      },
+      sessionTarget: "main",
+      wakeMode: "next-heartbeat",
+      payload: {
+        kind: "systemEvent",
+        text: "hi",
+      },
+    }) as unknown as Record<string, unknown>;
+    expect(validateCronAddParams(zeroEvery)).toBe(false);
+
+    const negativeAnchor = normalizeCronJobPatch({
+      schedule: {
+        kind: "every",
+        everyMs: "60000",
+        anchorMs: "-1",
+      },
+    }) as unknown as Record<string, unknown>;
+    expect(validateCronUpdateParams({ id: "job", patch: negativeAnchor })).toBe(false);
   });
 
   it("coerces sessionTarget and wakeMode casing", () => {
@@ -915,6 +1039,25 @@ describe("normalizeCronJobPatch", () => {
     expect(cleared.sessionKey).toBeNull();
   });
 
+  it("preserves completion webhook patches without delivery mode", () => {
+    const normalized = normalizeCronJobPatch({
+      delivery: {
+        completionDestination: {
+          mode: " WeBhOoK ",
+          to: " https://example.invalid/complete ",
+        },
+      },
+    }) as unknown as Record<string, unknown>;
+
+    expect(normalized.delivery).toEqual({
+      completionDestination: {
+        mode: "webhook",
+        to: "https://example.invalid/complete",
+      },
+    });
+    expect(validateCronUpdateParams({ id: "job", patch: normalized })).toBe(true);
+  });
+
   it("normalizes cron stagger values in patch schedules", () => {
     const normalized = normalizeCronJobPatch({
       schedule: { kind: "cron", expr: "0 * * * *", staggerMs: "30000" },
@@ -975,6 +1118,16 @@ describe("normalizeCronJobPatch", () => {
       at: new Date("2026-01-12T18:00:00Z").toISOString(),
     });
     expect(validateCronUpdateParams({ id: "job-1", patch: normalized })).toBe(true);
+  });
+
+  it("keeps out-of-range numeric schedule.atMs invalid instead of throwing for patches", () => {
+    const normalized = normalizeCronJobPatch({
+      schedule: { kind: "at", atMs: 8_640_000_000_000_001 },
+    }) as unknown as Record<string, unknown>;
+
+    const schedule = normalized.schedule as Record<string, unknown>;
+    expect(schedule).toEqual({ kind: "at" });
+    expect(validateCronUpdateParams({ id: "job-1", patch: normalized })).toBe(false);
   });
 
   it("prunes staggerMs from every schedules for patches", () => {

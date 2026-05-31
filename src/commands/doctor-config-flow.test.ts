@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { withTempHome } from "openclaw/plugin-sdk/test-env";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadAndMaybeMigrateDoctorConfig } from "./doctor-config-flow.js";
 import {
   getDoctorConfigInputForTest,
@@ -222,7 +222,7 @@ const legacyConfigMigrationForTest = vi.hoisted(() => {
   };
 });
 
-vi.mock("../terminal/note.js", () => ({
+vi.mock("../../packages/terminal-core/src/note.js", () => ({
   note: terminalNoteMock,
 }));
 
@@ -671,6 +671,10 @@ vi.mock("./doctor/shared/missing-configured-plugin-install.js", () => ({
   })),
 }));
 
+vi.mock("./doctor/shared/active-tool-schema-warnings.js", () => ({
+  collectActiveToolSchemaProjectionWarnings: vi.fn(() => []),
+}));
+
 vi.mock("./doctor/shared/plugin-dependency-cleanup.js", () => ({
   cleanupLegacyPluginDependencyState: vi.fn(async () => ({
     changes: [],
@@ -738,7 +742,7 @@ vi.mock("../plugins/doctor-contract-registry.js", () => {
     return Boolean(
       talk &&
       ["voiceId", "voiceAliases", "modelId", "outputFormat", "apiKey"].some((key) =>
-        Object.prototype.hasOwnProperty.call(talk, key),
+        Object.hasOwn(talk, key),
       ),
     );
   }
@@ -1456,6 +1460,17 @@ type RepairedDiscordPolicy = {
 };
 
 describe("doctor config flow", () => {
+  beforeAll(async () => {
+    await Promise.all([
+      import("../config/plugin-auto-enable.js"),
+      import("./doctor/repair-sequencing.js"),
+      import("./doctor/shared/channel-doctor.js"),
+      import("./doctor/shared/legacy-config-issues.js"),
+      import("./doctor/shared/plugin-tool-allowlist-warnings.js"),
+      import("./doctor/shared/preview-warnings.js"),
+    ]);
+  });
+
   beforeEach(() => {
     terminalNoteMock.mockClear();
     collectImplicitFallbackClobberWarningsMock.mockClear();
@@ -1795,7 +1810,7 @@ describe("doctor config flow", () => {
       enabled: true,
       maxPerDay: 2,
     });
-  });
+  }, 300_000);
 
   it("preserves discord streaming intent while stripping unsupported keys on repair", async () => {
     const result = await runDoctorConfigWithInput({

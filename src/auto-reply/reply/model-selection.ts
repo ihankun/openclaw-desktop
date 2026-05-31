@@ -7,6 +7,7 @@ import type { ModelCatalogEntry } from "../../agents/model-catalog.js";
 import { parseConfiguredModelVisibilityEntries } from "../../agents/model-selection-shared.js";
 import {
   buildConfiguredModelCatalog,
+  legacyModelKey,
   modelKey,
   normalizeModelRef,
   normalizeProviderId,
@@ -23,7 +24,7 @@ import {
   OPENAI_CODEX_PROVIDER_ID,
   OPENAI_PROVIDER_ID,
   listOpenAIAuthProfileProvidersForAgentRuntime,
-} from "../../agents/openai-codex-routing.js";
+} from "../../agents/openai-routing.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { applyModelOverrideToSessionEntry } from "../../sessions/model-overrides.js";
@@ -388,7 +389,7 @@ export async function createModelSelectionState(params: {
       agentId: params.agentId,
       ...RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
     }).allowedCatalog;
-  const loadManifestCatalogForThinking = async () => {
+  const loadManifestCatalog = async () => {
     if (manifestModelCatalog) {
       return manifestModelCatalog;
     }
@@ -397,7 +398,7 @@ export async function createModelSelectionState(params: {
       config: cfg,
       fallbackToMetadataScan: false,
     });
-    logStage("manifest-catalog-loaded-for-thinking", `entries=${manifestModelCatalog.length}`);
+    logStage("manifest-catalog-loaded", `entries=${manifestModelCatalog.length}`);
     return manifestModelCatalog;
   };
   const resolveThinkingCatalog = async () => {
@@ -419,7 +420,7 @@ export async function createModelSelectionState(params: {
     // allowlist rows know only provider/id; manifest rows can prove reasoning
     // support without opening the Pi auth-backed model registry.
     if (!modelCatalog && selectedCatalogEntry?.reasoning === undefined) {
-      const manifestCatalog = buildThinkingCatalog(await loadManifestCatalogForThinking());
+      const manifestCatalog = buildThinkingCatalog(await loadManifestCatalog());
       const manifestSelectedEntry = findSelectedCatalogEntry({
         catalog: manifestCatalog,
         provider,
@@ -458,10 +459,40 @@ export async function createModelSelectionState(params: {
       return defaultThinkingLevel;
     }
     const agentThinkingDefault = agentEntry?.thinkingDefault as ThinkLevel | undefined;
+    if (agentThinkingDefault) {
+      defaultThinkingLevel = agentThinkingDefault;
+      return defaultThinkingLevel;
+    }
+    const configuredModels = cfg.agents?.defaults?.models;
+    const canonicalKey = modelKey(provider, model);
+    const legacyKey = legacyModelKey(provider, model);
+    const configuredModelThinkingDefault =
+      configuredModels?.[canonicalKey]?.params?.thinking ??
+      (legacyKey ? configuredModels?.[legacyKey]?.params?.thinking : undefined);
+    if (
+      configuredModelThinkingDefault === false ||
+      configuredModelThinkingDefault === "disabled" ||
+      configuredModelThinkingDefault === "none"
+    ) {
+      defaultThinkingLevel = "off";
+      return defaultThinkingLevel;
+    }
+    if (
+      configuredModelThinkingDefault === "off" ||
+      configuredModelThinkingDefault === "minimal" ||
+      configuredModelThinkingDefault === "low" ||
+      configuredModelThinkingDefault === "medium" ||
+      configuredModelThinkingDefault === "high" ||
+      configuredModelThinkingDefault === "xhigh" ||
+      configuredModelThinkingDefault === "adaptive" ||
+      configuredModelThinkingDefault === "max"
+    ) {
+      defaultThinkingLevel = configuredModelThinkingDefault;
+      return defaultThinkingLevel;
+    }
     const configuredThinkingDefault = agentCfg?.thinkingDefault as ThinkLevel | undefined;
-    const explicitThinkingDefault = agentThinkingDefault ?? configuredThinkingDefault;
-    if (explicitThinkingDefault) {
-      defaultThinkingLevel = explicitThinkingDefault;
+    if (configuredThinkingDefault) {
+      defaultThinkingLevel = configuredThinkingDefault;
       return defaultThinkingLevel;
     }
     const catalogForThinking = await resolveThinkingCatalog();
@@ -475,18 +506,46 @@ export async function createModelSelectionState(params: {
     return defaultThinkingLevel;
   };
 
+  let defaultReasoningLevel: "on" | "off" | undefined;
   const resolveDefaultReasoningLevel = async (): Promise<"on" | "off"> => {
+    if (defaultReasoningLevel) {
+      return defaultReasoningLevel;
+    }
     let catalogForReasoning = modelCatalog ?? allowedModelCatalog;
-    if (!catalogForReasoning || catalogForReasoning.length === 0) {
+    let selectedReasoningEntry = findSelectedCatalogEntry({
+      catalog: catalogForReasoning,
+      provider,
+      model,
+    });
+    if (!modelCatalog && selectedReasoningEntry?.reasoning === undefined) {
+      const manifestCatalog = await loadManifestCatalog();
+      const manifestReasoningCatalog = hasAllowlist
+        ? buildThinkingCatalog(manifestCatalog)
+        : manifestCatalog;
+      const manifestSelectedEntry = findSelectedCatalogEntry({
+        catalog: manifestReasoningCatalog,
+        provider,
+        model,
+      });
+      if (manifestSelectedEntry?.reasoning !== undefined) {
+        catalogForReasoning = manifestReasoningCatalog;
+        selectedReasoningEntry = manifestSelectedEntry;
+      }
+    }
+    if (
+      (!catalogForReasoning || catalogForReasoning.length === 0) &&
+      selectedReasoningEntry?.reasoning === undefined
+    ) {
       modelCatalog = await (await loadModelCatalogRuntime()).loadModelCatalog({ config: cfg });
       logStage("catalog-loaded-for-reasoning", `entries=${modelCatalog.length}`);
       catalogForReasoning = modelCatalog;
     }
-    return resolveReasoningDefault({
+    defaultReasoningLevel = resolveReasoningDefault({
       provider,
       model,
       catalog: catalogForReasoning,
     });
+    return defaultReasoningLevel;
   };
 
   return {

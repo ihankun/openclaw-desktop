@@ -240,8 +240,8 @@ export type PluginRuntimeCore = {
   };
   media: {
     loadWebMedia: typeof import("../../media/web-media.js").loadWebMedia;
-    detectMime: typeof import("../../media/mime.js").detectMime;
-    mediaKindFromMime: typeof import("../../media/constants.js").mediaKindFromMime;
+    detectMime: typeof import("@openclaw/media-core/mime").detectMime;
+    mediaKindFromMime: typeof import("@openclaw/media-core/constants").mediaKindFromMime;
     isVoiceCompatibleAudio: typeof import("../../media/audio.js").isVoiceCompatibleAudio;
     getImageMetadata: typeof import("../../media/media-services.js").getImageMetadata;
     resizeToJpeg: typeof import("../../media/media-services.js").resizeToJpeg;
@@ -311,6 +311,9 @@ export type PluginRuntimeCore = {
     openKeyedStore: <T>(
       options: import("../../plugin-state/plugin-state-store.types.js").OpenKeyedStoreOptions,
     ) => import("../../plugin-state/plugin-state-store.types.js").PluginStateKeyedStore<T>;
+    openSyncKeyedStore: <T>(
+      options: import("../../plugin-state/plugin-state-store.types.js").OpenKeyedStoreOptions,
+    ) => import("../../plugin-state/plugin-state-store.types.js").PluginStateSyncKeyedStore<T>;
   };
   tasks: {
     runs: PluginRuntimeTaskRuns;

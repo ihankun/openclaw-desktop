@@ -8,6 +8,7 @@ import {
   handleDynamicToolCallWithTimeout,
   resolveDynamicToolCallTimeoutMs,
   resolveTerminalDynamicToolBatchAction,
+  shouldBlockTerminalReleaseForNonTerminalDynamicToolResult,
   shouldReleaseTurnAfterTerminalDynamicTool,
   toCodexDynamicToolProgressResponse,
   toCodexDynamicToolProtocolResponse,
@@ -36,6 +37,22 @@ describe("dynamic tool execution helpers", () => {
         config: undefined,
       }),
     ).toBe(timeoutMs);
+  });
+
+  it("ignores partial dynamic tool timeout strings", () => {
+    expect(
+      resolveDynamicToolCallTimeoutMs({
+        call: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "call-partial-timeout",
+          namespace: null,
+          tool: "session_status",
+          arguments: { timeoutMs: "1abc" },
+        },
+        config: undefined,
+      }),
+    ).toBe(CODEX_DYNAMIC_TOOL_TIMEOUT_MS);
   });
 
   it("uses configured image generation timeouts for Codex dynamic tool calls", () => {
@@ -346,5 +363,27 @@ describe("dynamic tool execution helpers", () => {
         hasPendingTerminalDynamicToolRelease: true,
       }),
     ).toBe("release-pending-terminal");
+  });
+
+  it("does not let async-start tool results block terminal side-effect batches", () => {
+    const asyncStartedResponse = {
+      contentItems: [{ type: "inputText" as const, text: "Background task started." }],
+      success: true,
+    };
+    Object.defineProperty(asyncStartedResponse, "asyncStarted", {
+      configurable: true,
+      enumerable: false,
+      value: true,
+    });
+
+    expect(shouldBlockTerminalReleaseForNonTerminalDynamicToolResult(asyncStartedResponse)).toBe(
+      false,
+    );
+    expect(
+      shouldBlockTerminalReleaseForNonTerminalDynamicToolResult({
+        contentItems: [{ type: "inputText", text: "regular output" }],
+        success: true,
+      }),
+    ).toBe(true);
   });
 });
