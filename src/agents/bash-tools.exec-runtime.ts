@@ -829,7 +829,6 @@ export async function runExecProcess(opts: {
       shellArgs,
       cwd: opts.workdir,
       env: shellRuntimeEnv,
-      enabled: true,
     });
 
     const childArgv = [shell, ...shellArgs, commandWithShellSnapshot];
@@ -992,7 +991,7 @@ export async function runExecProcess(opts: {
       });
       return outcome;
     })
-    .catch((err): ExecProcessOutcome => {
+    .catch((err: unknown): ExecProcessOutcome => {
       updatesDisabled = true;
       markExited(session, null, null, "failed");
       maybeNotifyOnExit(session, "failed");

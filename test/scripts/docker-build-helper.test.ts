@@ -96,7 +96,7 @@ function packageBackedDockerRunnerPaths(): string[] {
     .filter((entry) => entry.endsWith("-docker.sh"))
     .map((entry) => join("scripts/e2e", entry))
     .filter((path) => readFileSync(path, "utf8").includes("docker_e2e_prepare_package_tgz"))
-    .sort();
+    .toSorted();
 }
 
 function shellQuote(value: string): string {
@@ -1552,7 +1552,9 @@ test -f "$TMPDIR/docker-cmd-seen"
 
     expect(runner).toContain("scripts/e2e/lib/plugin-update/unchanged-scenario.sh");
     expect(probe).toContain("plugin install record changed unexpectedly");
-    expect(probe).toContain("index.installRecords ?? index.records ?? config.plugins?.installs");
+    expect(probe).toContain(
+      "readPluginInstallRecords({ fallbackRecords: config.plugins?.installs ?? {} })",
+    );
     expect(scenario).toContain("Config changed unexpectedly for modern package");
     expect(scenario).not.toContain("before_hash");
   });

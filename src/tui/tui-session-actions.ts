@@ -45,9 +45,51 @@ type SessionInfoDefaults = {
 };
 
 type SessionInfoEntry = SessionInfo & {
+  key?: string;
+  sessionId?: string;
   modelOverride?: string;
   providerOverride?: string;
 };
+
+function thinkingLevelsEqual(
+  left?: Array<{ id: string; label: string }>,
+  right?: Array<{ id: string; label: string }>,
+): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right || left.length !== right.length) {
+    return false;
+  }
+  return left.every((level, index) => {
+    const other = right[index];
+    return other?.id === level.id && other.label === level.label;
+  });
+}
+
+function goalEquals(left: SessionInfo["goal"], right: SessionInfo["goal"]): boolean {
+  return left === right || JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+}
+
+function sessionInfoUiEquals(left: SessionInfo, right: SessionInfo): boolean {
+  return (
+    left.thinkingLevel === right.thinkingLevel &&
+    thinkingLevelsEqual(left.thinkingLevels, right.thinkingLevels) &&
+    left.fastMode === right.fastMode &&
+    left.verboseLevel === right.verboseLevel &&
+    left.traceLevel === right.traceLevel &&
+    left.reasoningLevel === right.reasoningLevel &&
+    left.model === right.model &&
+    left.modelProvider === right.modelProvider &&
+    left.contextTokens === right.contextTokens &&
+    left.inputTokens === right.inputTokens &&
+    left.outputTokens === right.outputTokens &&
+    left.totalTokens === right.totalTokens &&
+    left.responseUsage === right.responseUsage &&
+    left.displayName === right.displayName &&
+    goalEquals(left.goal, right.goal)
+  );
+}
 
 export function createSessionActions(context: SessionActionContext) {
   const {
@@ -69,7 +111,8 @@ export function createSessionActions(context: SessionActionContext) {
     rememberSessionKey,
     emptySessionInfoDefaults,
   } = context;
-  let refreshSessionInfoPromise: Promise<void> = Promise.resolve();
+  let refreshSessionInfoInFlight: Promise<void> | null = null;
+  let refreshSessionInfoQueued = false;
   let lastSessionDefaults: SessionInfoDefaults | null = null;
 
   const applyAgentsResult = (result: TuiAgentsList) => {
@@ -145,6 +188,7 @@ export function createSessionActions(context: SessionActionContext) {
     entry?: SessionInfoEntry | null;
     defaults?: SessionInfoDefaults | null;
     force?: boolean;
+    clearMissingUsage?: boolean;
   }) => {
     const hasEntryUpdate = "entry" in params;
     const entry = params.entry ?? undefined;
@@ -202,6 +246,17 @@ export function createSessionActions(context: SessionActionContext) {
     if (entry?.totalTokens !== undefined) {
       next.totalTokens = entry.totalTokens;
     }
+    if (params.clearMissingUsage) {
+      if (entry?.inputTokens === undefined) {
+        next.inputTokens = null;
+      }
+      if (entry?.outputTokens === undefined) {
+        next.outputTokens = null;
+      }
+      if (entry?.totalTokens === undefined) {
+        next.totalTokens = null;
+      }
+    }
     if (hasEntryUpdate) {
       next.goal = entry?.goal;
     }
@@ -224,10 +279,17 @@ export function createSessionActions(context: SessionActionContext) {
       next.model = selection.model;
     }
 
+    const previous = state.sessionInfo;
+    const uiChanged = !sessionInfoUiEquals(previous, next);
+    if (!uiChanged && previous.updatedAt === next.updatedAt) {
+      return;
+    }
     state.sessionInfo = next;
-    updateAutocompleteProvider();
-    updateFooter();
-    tui.requestRender();
+    if (uiChanged) {
+      updateAutocompleteProvider();
+      updateFooter();
+      tui.requestRender();
+    }
   };
 
   const runRefreshSessionInfo = async () => {
@@ -274,12 +336,25 @@ export function createSessionActions(context: SessionActionContext) {
     }
   };
 
+  const drainRefreshSessionInfo = async () => {
+    do {
+      // Many TUI paths ask for the same session snapshot at once; keep one in-flight
+      // lookup and at most one follow-up so bursts do not queue stale backend calls.
+      refreshSessionInfoQueued = false;
+      await runRefreshSessionInfo();
+    } while (refreshSessionInfoQueued);
+  };
+
   const refreshSessionInfo = async () => {
-    refreshSessionInfoPromise = refreshSessionInfoPromise.then(
-      runRefreshSessionInfo,
-      runRefreshSessionInfo,
-    );
-    await refreshSessionInfoPromise;
+    if (refreshSessionInfoInFlight) {
+      refreshSessionInfoQueued = true;
+      await refreshSessionInfoInFlight;
+      return;
+    }
+    refreshSessionInfoInFlight = drainRefreshSessionInfo().finally(() => {
+      refreshSessionInfoInFlight = null;
+    });
+    await refreshSessionInfoInFlight;
   };
 
   const applySessionInfoFromPatch = (
@@ -340,16 +415,43 @@ export function createSessionActions(context: SessionActionContext) {
       const record = history as {
         messages?: unknown[];
         sessionId?: string;
+        sessionInfo?: SessionInfoEntry;
+        defaults?: SessionInfoDefaults;
         thinkingLevel?: string;
         fastMode?: boolean;
         verboseLevel?: string;
         traceLevel?: string;
       };
-      state.currentSessionId = typeof record.sessionId === "string" ? record.sessionId : null;
-      state.sessionInfo.thinkingLevel = record.thinkingLevel ?? state.sessionInfo.thinkingLevel;
-      state.sessionInfo.fastMode = record.fastMode ?? state.sessionInfo.fastMode;
-      state.sessionInfo.verboseLevel = record.verboseLevel ?? state.sessionInfo.verboseLevel;
-      state.sessionInfo.traceLevel = record.traceLevel ?? state.sessionInfo.traceLevel;
+      const sessionInfo = record.sessionInfo;
+      if (sessionInfo?.key && sessionInfo.key !== state.currentSessionKey) {
+        updateAgentFromSessionKey(sessionInfo.key);
+        state.currentSessionKey = sessionInfo.key;
+        updateHeader();
+      }
+      const historySessionInfo =
+        sessionInfo && sessionInfo.thinkingLevel === undefined && record.thinkingLevel !== undefined
+          ? { ...sessionInfo, thinkingLevel: record.thinkingLevel }
+          : sessionInfo;
+      state.currentSessionId =
+        typeof sessionInfo?.sessionId === "string"
+          ? sessionInfo.sessionId
+          : typeof record.sessionId === "string"
+            ? record.sessionId
+            : null;
+      applySessionInfo({
+        entry: historySessionInfo ?? {
+          sessionId: record.sessionId,
+          thinkingLevel: record.thinkingLevel,
+          fastMode: record.fastMode,
+          verboseLevel: record.verboseLevel,
+          traceLevel: record.traceLevel,
+        },
+        defaults: record.defaults,
+        clearMissingUsage: Boolean(historySessionInfo),
+      });
+      if (!sessionInfo) {
+        await refreshSessionInfo();
+      }
       const showTools = (state.sessionInfo.verboseLevel ?? "off") !== "off";
       chatLog.clearAll();
       btw.clear();
@@ -408,7 +510,6 @@ export function createSessionActions(context: SessionActionContext) {
     } catch (err) {
       chatLog.addSystem(`history failed: ${String(err)}`);
     }
-    await refreshSessionInfo();
     tui.requestRender();
   };
 

@@ -10,9 +10,9 @@ import {
 } from "../state/openclaw-state-db.js";
 import { resolveConfigDir } from "../utils.js";
 import { parseJsonWithJson5Fallback } from "../utils/parse-json-compat.js";
+import { cronStoreKey } from "./store/key.js";
 import {
   assertCronStoreCanPersist,
-  cronStoreKey,
   loadedCronStoreFromRows,
   loadCronRows,
   replaceCronRows,
@@ -46,7 +46,7 @@ export function resolveCronQuarantinePath(storePath: string): string {
   return `${storePath}-quarantine.json`;
 }
 
-export function resolveCronStorePath(storePath?: string) {
+export function resolveCronJobsStorePath(storePath?: string) {
   if (storePath?.trim()) {
     const raw = storePath.trim();
     if (raw.startsWith("~")) {
@@ -57,7 +57,7 @@ export function resolveCronStorePath(storePath?: string) {
   return resolveDefaultCronStorePath();
 }
 
-export async function loadCronStoreWithConfigJobs(storePath: string): Promise<LoadedCronStore> {
+export async function loadCronJobsStoreWithConfigJobs(storePath: string): Promise<LoadedCronStore> {
   const resolvedStorePath = path.resolve(storePath);
   const storeKey = cronStoreKey(resolvedStorePath);
   const database = openOpenClawStateDatabase().db;
@@ -74,11 +74,11 @@ export async function loadCronStoreWithConfigJobs(storePath: string): Promise<Lo
   };
 }
 
-export async function loadCronStore(storePath: string): Promise<CronStoreFile> {
-  return (await loadCronStoreWithConfigJobs(storePath)).store;
+export async function loadCronJobsStore(storePath: string): Promise<CronStoreFile> {
+  return (await loadCronJobsStoreWithConfigJobs(storePath)).store;
 }
 
-export function loadCronStoreSync(storePath: string): CronStoreFile {
+export function loadCronJobsStoreSync(storePath: string): CronStoreFile {
   const resolvedStorePath = path.resolve(storePath);
   const storeKey = cronStoreKey(resolvedStorePath);
   const database = openOpenClawStateDatabase().db;
@@ -105,7 +105,7 @@ async function atomicWrite(filePath: string, content: string, dirMode = 0o700): 
   });
 }
 
-export async function saveCronStore(
+export async function saveCronJobsStore(
   storePath: string,
   store: CronStoreFile,
   opts?: SaveCronStoreOptions,
@@ -124,12 +124,33 @@ export async function saveCronStore(
   });
 }
 
-export async function loadCronQuarantineFile(path: string): Promise<CronQuarantineFile> {
+// Public plugin SDK seam; core callers use the SQLite-backed cron-jobs names above.
+export function resolveCronStorePath(storePath?: string) {
+  return resolveCronJobsStorePath(storePath);
+}
+
+export async function loadCronStore(storePath: string): Promise<CronStoreFile> {
+  return await loadCronJobsStore(storePath);
+}
+
+export function loadCronStoreSync(storePath: string): CronStoreFile {
+  return loadCronJobsStoreSync(storePath);
+}
+
+export async function saveCronStore(
+  storePath: string,
+  store: CronStoreFile,
+  opts?: SaveCronStoreOptions,
+) {
+  await saveCronJobsStore(storePath, store, opts);
+}
+
+export async function loadCronQuarantineFile(pathLocal: string): Promise<CronQuarantineFile> {
   try {
-    const raw = await fs.promises.readFile(path, "utf-8");
+    const raw = await fs.promises.readFile(pathLocal, "utf-8");
     const parsed = parseJsonWithJson5Fallback(raw);
     if (!isRecord(parsed) || parsed.version !== 1 || !Array.isArray(parsed.jobs)) {
-      throw new Error(`Unsupported cron quarantine file shape at ${path}`);
+      throw new Error(`Unsupported cron quarantine file shape at ${pathLocal}`);
     }
     const jobs = parsed.jobs.map((entry, index) => {
       if (
@@ -137,7 +158,7 @@ export async function loadCronQuarantineFile(path: string): Promise<CronQuaranti
         typeof entry.reason !== "string" ||
         (!isRecord(entry.job) && !("raw" in entry))
       ) {
-        throw new Error(`Unsupported cron quarantine entry at ${path} index ${index}`);
+        throw new Error(`Unsupported cron quarantine entry at ${pathLocal} index ${index}`);
       }
       const sourceIndex = typeof entry.sourceIndex === "number" ? entry.sourceIndex : -1;
       const quarantinedAtMs =

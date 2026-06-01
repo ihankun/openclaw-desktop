@@ -92,7 +92,10 @@ const isProcessAlive = (pid, signalProcess) => {
   return true;
 };
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 
 const createWatchLockKey = (cwd, args) =>
   createHash("sha256").update(cwd).update("\0").update(args.join("\0")).digest("hex").slice(0, 12);
@@ -360,7 +363,7 @@ export async function runWatchMain(params = {}) {
       if (onSigTerm) {
         deps.process.off("SIGTERM", onSigTerm);
       }
-      reject(err);
+      reject(toLintErrorObject(err, "Non-Error rejection"));
     };
 
     const resolveCreateWatcher = async () => {
@@ -481,20 +484,38 @@ export async function runWatchMain(params = {}) {
         startRunner();
         startWatcher();
       })
-      .catch((error) => {
-        logWatcher(`Failed to acquire watcher lock: ${error?.message ?? "unknown error"}`, deps);
-        settle(1);
-      });
+      .catch(
+        /** @param {unknown} error */ (error) => {
+          logWatcher(`Failed to acquire watcher lock: ${error?.message ?? "unknown error"}`, deps);
+          settle(1);
+        },
+      );
   });
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   void runWatchMain()
     .then((code) => process.exit(code))
-    .catch((err) => {
-      if (!isInvalidPackageConfigError(err)) {
-        console.error(err);
-      }
-      process.exit(1);
-    });
+    .catch(
+      /** @param {unknown} err */ (err) => {
+        if (!isInvalidPackageConfigError(err)) {
+          console.error(err);
+        }
+        process.exit(1);
+      },
+    );
+}
+
+function toLintErrorObject(value, fallbackMessage) {
+  if (value instanceof Error) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return new Error(value);
+  }
+  const error = new Error(fallbackMessage, { cause: value });
+  if ((typeof value === "object" && value !== null) || typeof value === "function") {
+    Object.assign(error, value);
+  }
+  return error;
 }
