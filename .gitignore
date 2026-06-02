@@ -38,6 +38,9 @@ apps/android/.cxx/
 apps/android/.kotlin/
 apps/android/benchmark/results/
 
+apps/electron/build-staging/
+apps/electron/release
+
 # Bun build artifacts
 *.bun-build
 apps/macos/.build/
