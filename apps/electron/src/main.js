@@ -463,6 +463,45 @@ function notifyGatewayReady() {
 // Window
 // ============================================================================
 
+const TITLE_BAR_PADDING_CSS = `
+  /* Only push the left sidebar nav down by 38px to clear macOS traffic lights.
+     The right column (topbar + content) stays at its natural position,
+     avoiding the empty gap the user reported. */
+  .shell-nav {
+    padding-top: 38px !important;
+  }
+  /* Mobile: .shell-nav becomes position: fixed — use top offset instead */
+  @media (max-width: 1100px) {
+    .shell-nav {
+      top: 38px !important;
+      padding-top: 0 !important;
+    }
+  }
+  /* Drag region: top 38px of the sidebar */
+  .shell-nav {
+    position: relative !important;
+  }
+  .shell-nav::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 38px;
+    -webkit-app-region: drag;
+    z-index: 100;
+    pointer-events: auto;
+  }
+`;
+
+function injectTitleBarPadding(contents) {
+  try {
+    contents.insertCSS(TITLE_BAR_PADDING_CSS);
+  } catch (err) {
+    log("Error injecting title bar CSS:", err.message);
+  }
+}
+
 function showMainWindow() {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.show();
@@ -480,6 +519,8 @@ function createMainWindow() {
     minWidth: MIN_WINDOW_WIDTH,
     minHeight: MIN_WINDOW_HEIGHT,
     title: "OpenClaw",
+    titleBarStyle: "hidden",
+    trafficLightPosition: { x: 16, y: 16 },
     show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -493,6 +534,21 @@ function createMainWindow() {
 
   mainWindow.once("ready-to-show", () => {
     mainWindow.show();
+  });
+
+  // Inject title-bar padding when gateway page loads
+  mainWindow.webContents.on("did-navigate", (_event, url) => {
+    if (url.includes(GATEWAY_HOST)) {
+      injectTitleBarPadding(mainWindow.webContents);
+    }
+  });
+
+  // Also catch in-page navigations and sub-frames
+  mainWindow.webContents.on("did-finish-load", () => {
+    const url = mainWindow.webContents.getURL();
+    if (url.includes(GATEWAY_HOST)) {
+      injectTitleBarPadding(mainWindow.webContents);
+    }
   });
 
   // Auto-open DevTools on navigation failure (useful for packaged debugging)

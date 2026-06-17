@@ -53,9 +53,19 @@
       color: var(--text);
       user-select: none;
       transition: background 0.3s, color 0.3s;
+      padding-top: 38px;
     }
 
     .container { text-align: center; }
+
+    /* Drag region at top for hidden title bar */
+    .titlebar-spacer {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      height: 38px;
+      -webkit-app-region: drag;
+      z-index: 100;
+    }
 
     .logo {
       width: 64px; height: 64px;
@@ -98,6 +108,7 @@
   </style>
 </head>
 <body>
+  <div class="titlebar-spacer"></div>
   <div class="container">
     <div class="logo">🦞</div>
     <div class="spinner"></div>
