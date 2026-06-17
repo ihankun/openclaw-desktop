@@ -4,6 +4,7 @@
 import { setReplyPayloadMetadata, type ReplyPayload } from "../auto-reply/reply-payload.js";
 import { SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
 import { appendExactAssistantMessageToSessionTranscript } from "../config/sessions/transcript.js";
+import { buildGenericCliContextEngineHostSupport } from "../context-engine/host-compat.js";
 import {
   assertAgentRunLifecycleGenerationCurrent,
   captureAgentRunLifecycleGeneration,
@@ -28,6 +29,7 @@ import type { PreparedCliRunContext, RunCliAgentParams } from "./cli-runner/type
 import { claudeCliSessionTranscriptHasContent as claudeCliSessionTranscriptHasContentImpl } from "./command/attempt-execution.helpers.js";
 import { classifyFailoverReason, isFailoverErrorMessage } from "./embedded-agent-helpers.js";
 import type { EmbeddedAgentRunResult } from "./embedded-agent-runner.js";
+import { waitForDeferredTurnMaintenanceForSession } from "./embedded-agent-runner/context-engine-maintenance.js";
 import { buildEmbeddedRunPayloads } from "./embedded-agent-runner/run/payloads.js";
 import { FailoverError, isFailoverError, resolveFailoverStatus } from "./failover-error.js";
 import {
@@ -332,6 +334,9 @@ async function finalizeCliContextEngineTurn(params: {
   }
 
   let deferredTurnMaintenance: Promise<void> | undefined;
+  const contextEngineHostSupport = buildGenericCliContextEngineHostSupport({
+    backendId: context.backendResolved.id,
+  });
   const result = await finalizeHarnessContextEngineTurn({
     contextEngine: context.contextEngine,
     promptError: false,
@@ -344,6 +349,9 @@ async function finalizeCliContextEngineTurn(params: {
     messagesSnapshot: [...prePromptMessages, ...turnMessages],
     prePromptMessageCount: prePromptMessages.length,
     config: context.contextEngineConfig,
+    contextEngineHostSupport,
+    providerId: runParams.provider,
+    modelId: context.modelId,
     runMaintenance: async (maintenanceParams) =>
       await runHarnessContextEngineMaintenance({
         ...maintenanceParams,
@@ -480,6 +488,9 @@ export async function runPreparedCliAgent(
   const hasAgentEndHooks = hookRunner?.hasHooks("agent_end") === true;
   const hasBeforeAgentRunHooks = hookRunner?.hasHooks("before_agent_run") === true;
   const needsHookHistory = hasLlmInputHooks || hasAgentEndHooks || hasBeforeAgentRunHooks;
+  // Prior turn maintenance can rewrite transcript entries after finalization.
+  // Reads for the next same-session inference must observe that rewrite.
+  await waitForDeferredTurnMaintenanceForSession(params.sessionKey ?? params.sessionId);
   const historyMessages = needsHookHistory
     ? await loadCliSessionHistoryMessages({
         sessionId: params.sessionId,
@@ -862,6 +873,8 @@ export async function runPreparedCliAgent(
     const agentSessionId = unflushedCliSessionId
       ? ""
       : (resultParams.effectiveCliSessionId ?? params.sessionId ?? "");
+    const yielded = resultParams.output.yielded === true;
+    const stopReason = yielded ? "end_turn" : "completed";
 
     return {
       payloads,
@@ -877,6 +890,7 @@ export async function runPreparedCliAgent(
             }
           : {}),
         systemPromptReport: context.systemPromptReport,
+        ...(yielded ? { yielded: true, livenessState: "paused" as const, stopReason } : {}),
         executionTrace: {
           winnerProvider: params.provider,
           winnerModel: context.modelId,
@@ -895,8 +909,8 @@ export async function runPreparedCliAgent(
           ...(context.effectiveAuthProfileId ? { authMode: "auth-profile" } : {}),
         },
         completion: {
-          finishReason: "stop",
-          stopReason: "completed",
+          finishReason: yielded ? "end_turn" : "stop",
+          stopReason,
           refusal: false,
         },
         agentMeta: {
@@ -963,6 +977,11 @@ export async function runPreparedCliAgent(
       sessionKey: params.sessionKey,
       sessionFile: params.sessionFile,
       config: context.contextEngineConfig,
+      contextEngineHostSupport: buildGenericCliContextEngineHostSupport({
+        backendId: context.backendResolved.id,
+      }),
+      providerId: params.provider,
+      modelId: context.modelId,
       warn: (message) => log.warn(message),
     });
     const contextEngineHistoryMessages = context.contextEngine
