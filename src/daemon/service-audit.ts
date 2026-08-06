@@ -5,11 +5,7 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
-import {
-  normalizeStringEntries,
-  sortUniqueStrings,
-} from "@openclaw/normalization-core/string-normalization";
-import { normalizeEnvVarKey } from "../infra/host-env-security.js";
+import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import { resolveInlineCommandMatch } from "../infra/shell-inline-command.js";
 import { POSIX_SHELL_WRAPPERS } from "../infra/shell-wrapper-resolution.js";
 import { parseTcpPort } from "../infra/tcp-port.js";
@@ -25,7 +21,7 @@ import { getMinimalServicePathPartsFromEnv } from "./service-env.js";
 import { SERVICE_PROXY_ENV_KEYS } from "./service-env.js";
 import {
   collectInlineManagedServiceEnvKeys,
-  hasInlineEnvironmentSource,
+  collectInlineServiceEnvKeys,
   isEnvironmentFileOnlySource,
 } from "./service-managed-env.js";
 import { isNonMinimalServicePathEntry, normalizeServicePathEntry } from "./service-path-policy.js";
@@ -297,15 +293,19 @@ function readGatewayServiceCommandPortState(
   if (!programArguments || programArguments.length === 0) {
     return { kind: "missing" };
   }
-  for (const [index, arg] of programArguments.entries()) {
+  let latest: GatewayServiceCommandPort = { kind: "missing" };
+  for (let index = 0; index < programArguments.length; index += 1) {
+    const arg = programArguments[index];
     if (arg === "--port") {
-      return parseGatewayPortArg(programArguments[index + 1]);
+      latest = parseGatewayPortArg(programArguments[index + 1]);
+      index += 1;
+      continue;
     }
-    if (arg.startsWith("--port=")) {
-      return parseGatewayPortArg(arg.slice("--port=".length));
+    if (arg?.startsWith("--port=")) {
+      latest = parseGatewayPortArg(arg.slice("--port=".length));
     }
   }
-  return { kind: "missing" };
+  return latest;
 }
 
 function auditGatewayServicePort(params: {
@@ -385,55 +385,11 @@ function auditManagedServiceEnvironment(
   });
 }
 
-function normalizeServiceEnvKey(key: string): string | null {
-  return normalizeEnvVarKey(key, { portable: true })?.toUpperCase() ?? null;
-}
-
-function readEnvironmentValueSource(
-  command: GatewayServiceCommand,
-  normalizedKey: string,
-): GatewayServiceEnvironmentValueSource | undefined {
-  for (const [rawKey, source] of Object.entries(command?.environmentValueSources ?? {})) {
-    if (normalizeServiceEnvKey(rawKey) === normalizedKey) {
-      return source;
-    }
-  }
-  return undefined;
-}
-
-const SERVICE_PROXY_ENV_KEY_SET = new Set(
-  SERVICE_PROXY_ENV_KEYS.flatMap((key) => {
-    const normalized = normalizeServiceEnvKey(key);
-    return normalized ? [normalized] : [];
-  }),
-);
-
-function collectInlineProxyEnvKeys(command: GatewayServiceCommand): string[] {
-  if (!command?.environment) {
-    return [];
-  }
-  const inlineKeys: string[] = [];
-  for (const [rawKey, value] of Object.entries(command.environment)) {
-    if (typeof value !== "string" || !value.trim()) {
-      continue;
-    }
-    const normalized = normalizeServiceEnvKey(rawKey);
-    if (!normalized || !SERVICE_PROXY_ENV_KEY_SET.has(normalized)) {
-      continue;
-    }
-    if (!hasInlineEnvironmentSource(readEnvironmentValueSource(command, normalized))) {
-      continue;
-    }
-    inlineKeys.push(normalized);
-  }
-  return sortUniqueStrings(inlineKeys);
-}
-
 function auditProxyServiceEnvironment(
   command: GatewayServiceCommand,
   issues: ServiceConfigIssue[],
 ) {
-  const inlineKeys = collectInlineProxyEnvKeys(command);
+  const inlineKeys = collectInlineServiceEnvKeys(command, SERVICE_PROXY_ENV_KEYS);
   if (inlineKeys.length === 0) {
     return;
   }

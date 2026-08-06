@@ -1,7 +1,7 @@
 // Minimax tests cover image generation provider plugin behavior.
 import * as providerAuth from "openclaw/plugin-sdk/provider-auth-runtime";
 import * as providerHttp from "openclaw/plugin-sdk/provider-http";
-import { installPinnedHostnameTestHooks } from "openclaw/plugin-sdk/test-env";
+import { installPinnedHostnameTestHooks } from "openclaw/plugin-sdk/test-media-understanding";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildMinimaxImageGenerationProvider,
@@ -78,6 +78,27 @@ describe("minimax image-generation provider", () => {
       url?: string;
     };
   }
+
+  it.each([
+    ["minimax", buildMinimaxImageGenerationProvider],
+    ["minimax-portal", buildMinimaxPortalImageGenerationProvider],
+  ])("advertises %s image generation using its own config-only credential", (providerId, build) => {
+    expect(
+      build().isConfigured?.({
+        cfg: {
+          models: {
+            providers: {
+              [providerId]: {
+                apiKey: "minimax-config-only-key",
+                baseUrl: "https://api.minimax.io/v1",
+                models: [],
+              },
+            },
+          },
+        },
+      }),
+    ).toBe(true);
+  });
 
   it("generates PNG buffers through the shared provider HTTP path", async () => {
     mockMinimaxApiKey();

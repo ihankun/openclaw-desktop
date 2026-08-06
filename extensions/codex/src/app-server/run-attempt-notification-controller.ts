@@ -45,6 +45,7 @@ export function createCodexAttemptNotificationController(
     finalizationHookBatchStatuses,
     pendingOpenClawDynamicToolCompletionIds,
     postToolRawAssistantCompletionIdleTimeoutMs,
+    completeTurn,
   } = turnRuntime;
   const {
     scheduleTerminalDynamicToolReleaseCheck,
@@ -71,6 +72,16 @@ export function createCodexAttemptNotificationController(
       }
       return;
     }
+    if (
+      (state.timedOut || state.localCompletionRequested) &&
+      notification.method === "turn/completed" &&
+      readCodexTurnCompletedNotification(notification.params)?.turn.status === "interrupted"
+    ) {
+      // Our cleanup interrupt proves the native turn ended; it must not replace
+      // an already-owned final answer, yield result, or recorded response usage.
+      completeTurn();
+      return;
+    }
     const notificationState = applyCodexTurnNotificationState({
       notification,
       threadId: resourceState.thread.threadId,
@@ -87,6 +98,12 @@ export function createCodexAttemptNotificationController(
       onReportExecutionNotification: reportExecutionNotification,
     });
     state.turnCrossedToolHandoff = notificationState.turnCrossedToolHandoff;
+    if (notificationState.isCurrentTurnNotification && notification.method === "item/completed") {
+      const item = readCodexNotificationItem(notification.params);
+      if (item?.type === "userMessage" && typeof item.clientId === "string") {
+        steeringQueue?.confirmConsumed(item.clientId);
+      }
+    }
     if (notificationState.isTurnAbortMarker) {
       state.sawCodexInterruptMarker = true;
     }
@@ -193,23 +210,28 @@ export function createCodexAttemptNotificationController(
         if (!state.timedOut && !runAbortController.signal.aborted) {
           await steeringQueue?.flushPending();
         }
-        state.completed = true;
-        turnWatches.clearCompletionIdleTimer();
-        turnWatches.clearAssistantCompletionIdleTimer();
-        turnWatches.clearTerminalIdleTimer();
-        state.resolveCompletion?.();
+        completeTurn();
       }
     }
   };
   const waitForActiveNativeTurnCompletion = async () => {
     const route = resourceState.turnRoute;
-    if (!route) {
+    const activeNativeTurnId =
+      resourceState.thread.lifecycle.activeTurnIds?.at(-1) ?? route?.observedNativeTurnId;
+    if (!route || !activeNativeTurnId) {
       return false;
     }
-    return await route.waitForTurnCompletion({
+    const watch = resourceState.turnRouter.watchNativeTurnCompletion({
+      threadId: route.threadId,
+      turnId: activeNativeTurnId,
       timeoutMs: Math.min(appServer.requestTimeoutMs, CODEX_APP_SERVER_NATIVE_TURN_WAIT_TIMEOUT_MS),
       signal: runAbortController.signal,
     });
+    try {
+      return await watch.completion;
+    } finally {
+      watch.cancel();
+    }
   };
   const noteNotificationReceived = (
     notification: CodexServerNotification,

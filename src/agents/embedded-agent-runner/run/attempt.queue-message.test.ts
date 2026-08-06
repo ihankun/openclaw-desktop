@@ -12,7 +12,7 @@ function steerWithDeliveryWait(
   activeSession: EmbeddedAgentActiveSessionSteerTarget,
   text: string,
   deliveryTimeoutMs = 10_000,
-): Promise<void> {
+): ReturnType<typeof steerActiveSessionWithOptionalDeliveryWait> {
   return steerActiveSessionWithOptionalDeliveryWait(activeSession, text, {
     deliveryTimeoutMs,
     waitForTranscriptCommit: true,
@@ -36,6 +36,42 @@ describe("embedded OpenClaw queued steering cancellation", () => {
     });
 
     expect(steer).toHaveBeenCalledWith("runtime prompt", undefined, recorder);
+  });
+
+  it("forwards ordered images with a queued steering message", async () => {
+    const steer = vi.fn(async () => undefined);
+    const images = [
+      { type: "image" as const, data: "first", mimeType: "image/jpeg" },
+      { type: "image" as const, data: "second", mimeType: "image/png" },
+    ];
+    const activeSession: EmbeddedAgentActiveSessionSteerTarget = {
+      steer,
+      subscribe: () => () => {},
+    };
+
+    await steerActiveSessionWithOptionalDeliveryWait(activeSession, "compare these", { images });
+
+    expect(steer).toHaveBeenCalledWith("compare these", images);
+  });
+
+  it("forwards ordered prompt facts with a queued steering message", async () => {
+    const steer = vi.fn(async () => undefined);
+    const media = [
+      { path: "/tmp/a.png", contentType: "image/png" },
+      { path: "/tmp/b.pdf", contentType: "application/pdf" },
+    ];
+    const imageOrder = ["offloaded", "inline"] as const;
+    const activeSession: EmbeddedAgentActiveSessionSteerTarget = {
+      steer,
+      subscribe: () => () => {},
+    };
+
+    await steerActiveSessionWithOptionalDeliveryWait(activeSession, "inspect both", {
+      media,
+      imageOrder: [...imageOrder],
+    });
+
+    expect(steer).toHaveBeenCalledWith("inspect both", undefined, undefined, media, imageOrder);
   });
 
   it("waits for the queued user message_end transcript boundary", async () => {
@@ -178,6 +214,28 @@ describe("embedded OpenClaw queued steering cancellation", () => {
       expect(queueMessages).toEqual([keepMessage]);
       expect(steeringUiMessages).toEqual(["keep unrelated queue entry"]);
       expect(unsubscribed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("marks a missing queued message as accepted without transcript confirmation", async () => {
+    vi.useFakeTimers();
+    const activeSession: EmbeddedAgentActiveSessionSteerTarget = {
+      agent: { steeringQueue: { messages: [] } },
+      getSteeringMessages: () => [],
+      steer: async () => {},
+      subscribe: () => () => {},
+    };
+
+    try {
+      const wait = steerWithDeliveryWait(activeSession, "possibly consumed", 1);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(wait).resolves.toEqual({
+        transcriptCommit: "unconfirmed",
+        errorMessage: "queued steering message was not committed to the transcript before timeout",
+      });
     } finally {
       vi.useRealTimers();
     }

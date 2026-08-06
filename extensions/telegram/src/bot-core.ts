@@ -11,6 +11,7 @@ import {
   resolveThreadBindingSpawnPolicy,
 } from "openclaw/plugin-sdk/conversation-runtime";
 import { formatErrorMessage, formatUncaughtError } from "openclaw/plugin-sdk/error-runtime";
+import { normalizeGroupActivation } from "openclaw/plugin-sdk/group-activation";
 import {
   isNativeCommandsExplicitlyDisabled,
   resolveNativeCommandsEnabled,
@@ -31,10 +32,13 @@ import {
   createTelegramMessageProcessor,
   resolveTelegramMessageTurnSettings,
 } from "./bot-message.js";
+import { defaultTelegramNativeCommandDeps } from "./bot-native-command-deps.runtime.js";
 import { registerTelegramNativeCommands } from "./bot-native-commands.js";
 import {
+  ensureTelegramMessageProcessingResult,
   getTelegramSpooledReplayDeferredParticipant,
   isTelegramSpooledReplayUpdate,
+  recordTelegramMessageProcessingResult,
   runWithTelegramUpdateProcessingFrame,
   TelegramSpooledReplayProcessingError,
 } from "./bot-processing-outcome.js";
@@ -45,6 +49,7 @@ import { apiThrottler, Bot, sequentialize, type ApiClientOptions } from "./bot.r
 import type { TelegramBotOptions } from "./bot.types.js";
 import { buildTelegramGroupPeerId } from "./bot/helpers.js";
 import { setTelegramCallbackQueryAnswerPromise } from "./callback-query-answer-state.js";
+import { TELEGRAM_CHAT_ACTION_INTERVAL_MS } from "./chat-action-timing.js";
 import {
   asTelegramClientFetch,
   createTelegramClientFetch,
@@ -59,9 +64,13 @@ import {
   recordTelegramGroupHistoryEntry,
 } from "./group-history-window.js";
 import { registerTelegramOutboundGroupHistoryRecorder } from "./outbound-message-context.js";
+import {
+  prepareTelegramPollAnswerContext,
+  settleTelegramPollAnswerContext,
+} from "./poll-answer-context.js";
 import { formatTelegramRawUpdateForLog } from "./raw-update-log.js";
 import { createTelegramSendChatActionHandler } from "./sendchataction-401-backoff.js";
-import { getTelegramSequentialKey } from "./sequential-key.js";
+import { getTelegramSequentialConstraints } from "./sequential-key.js";
 import { createTelegramThreadBindingManager } from "./thread-bindings.js";
 
 type TelegramBotRuntime = {
@@ -76,8 +85,6 @@ const DEFAULT_TELEGRAM_BOT_RUNTIME: TelegramBotRuntime = {
   sequentialize,
   apiThrottler,
 };
-const TELEGRAM_TYPING_COALESCE_MS = 4_000;
-
 export function createTelegramBotCore(
   opts: TelegramBotOptions & { telegramDeps: TelegramBotDeps },
 ): TelegramBotInstance {
@@ -120,16 +127,15 @@ export function createTelegramBotCore(
     });
   const finalFetch = createTelegramClientFetch({
     fetchImpl: asTelegramClientFetch(telegramTransport.fetch),
-    timeoutSeconds: telegramCfg?.timeoutSeconds,
     shutdownSignal: opts.fetchAbortSignal,
     transport: telegramTransport,
   });
 
   const timeoutSeconds = resolveTelegramClientTimeoutSeconds({
-    value: telegramCfg?.timeoutSeconds,
+    value: undefined,
     minimum: resolveTelegramClientTimeoutMinimumSeconds([
       opts.minimumClientTimeoutSeconds,
-      resolveTelegramOutboundClientTimeoutFloorSeconds(telegramCfg?.timeoutSeconds),
+      resolveTelegramOutboundClientTimeoutFloorSeconds(undefined),
     ]),
   });
   const apiRoot = normalizeOptionalString(telegramCfg.apiRoot);
@@ -187,6 +193,10 @@ export function createTelegramBotCore(
     try {
       const { result } = await runWithTelegramUpdateProcessingFrame(async () => {
         await next();
+        if (!getTelegramSpooledReplayDeferredParticipant()) {
+          // Accepted synchronous updates need one terminal fact at their middleware owner.
+          ensureTelegramMessageProcessingResult({ kind: "completed" });
+        }
       });
       const deferredWork = getTelegramSpooledReplayDeferredParticipant();
       if (deferredWork) {
@@ -229,7 +239,29 @@ export function createTelegramBotCore(
     await next();
   });
 
-  bot.use(botRuntime.sequentialize(getTelegramSequentialKey));
+  // poll_answer omits its chat and topic. Resolve the send-time route before
+  // sequentialize so the vote shares the same lane as ordinary session turns.
+  bot.use(async (ctx, next) => {
+    try {
+      prepareTelegramPollAnswerContext({ update: ctx.update, accountId: account.accountId });
+    } catch (error) {
+      if (isTelegramSpooledReplayUpdate(ctx.update)) {
+        recordTelegramMessageProcessingResult({ kind: "failed-retryable", error });
+        return;
+      }
+      throw error;
+    }
+    await next();
+  });
+
+  bot.use(botRuntime.sequentialize(getTelegramSequentialConstraints));
+
+  // A fast vote can know its route before outbound verification finishes. Hold
+  // only that route's sequential lane until registration succeeds or declines it.
+  bot.use(async (ctx, next) => {
+    await settleTelegramPollAnswerContext({ update: ctx.update, accountId: account.accountId });
+    await next();
+  });
 
   const rawUpdateLogger = createSubsystemLogger("gateway/channels/telegram/raw-update");
 
@@ -311,11 +343,15 @@ export function createTelegramBotCore(
       if (!getSessionEntry) {
         return undefined;
       }
-      const entry = getSessionEntry({ storePath, sessionKey });
-      if (entry?.groupActivation === "always") {
+      const storedActivation = getSessionEntry({ storePath, sessionKey })?.groupActivation;
+      const activation =
+        storedActivation === "mention" || storedActivation === "always"
+          ? normalizeGroupActivation(storedActivation)
+          : undefined;
+      if (activation === "always") {
         return false;
       }
-      if (entry?.groupActivation === "mention") {
+      if (activation === "mention") {
         return true;
       }
     } catch (err) {
@@ -350,7 +386,7 @@ export function createTelegramBotCore(
     sendChatActionFn: (chatId, action, threadParams) =>
       bot.api.sendChatAction(chatId, action, threadParams),
     logger: (message) => logVerbose(`telegram: ${message}`),
-    minIntervalMs: TELEGRAM_TYPING_COALESCE_MS,
+    minIntervalMs: TELEGRAM_CHAT_ACTION_INTERVAL_MS,
   });
 
   const processMessage = createTelegramMessageProcessor({
@@ -381,7 +417,10 @@ export function createTelegramBotCore(
     resolveTelegramGroupConfig,
     shouldSkipUpdate,
     opts,
-    telegramDeps,
+    telegramDeps: {
+      ...telegramDeps,
+      sendMessageTelegram: defaultTelegramNativeCommandDeps.sendMessageTelegram,
+    },
   });
 
   registerTelegramHandlers({

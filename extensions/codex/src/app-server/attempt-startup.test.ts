@@ -3,13 +3,15 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type {
-  CodexBundleMcpThreadConfig,
-  EmbeddedRunAttemptParams,
+import {
+  AgentHarnessPreflightError,
+  type CodexBundleMcpThreadConfig,
+  type EmbeddedRunAttemptParams,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { startCodexAttemptThread } from "./attempt-startup.js";
-import { CodexAppServerClient } from "./client.js";
+import { isCodexAppServerStartupError } from "./attempt-timeouts.js";
+import { CodexAppServerClient, isCodexAppServerRequestTimeoutError } from "./client.js";
 import {
   CODEX_PLUGINS_MARKETPLACE_NAME,
   type CodexPluginConfig,
@@ -174,7 +176,7 @@ async function captureExpectedRuntimeArtifact(
     before,
     startOptions: appServer.start,
     spawnIdentity,
-    runtimeIdentity: { serverVersion: "0.143.0", userAgent: "openclaw/0.143.0 (macOS; test)" },
+    runtimeIdentity: { serverVersion: "0.146.1", userAgent: "openclaw/0.146.1 (macOS; test)" },
   });
 }
 
@@ -184,7 +186,7 @@ async function answerInitialize(harness: ClientHarness): Promise<void> {
     timeout: HARNESS_REQUEST_TIMEOUT_MS,
   });
   const initialize = JSON.parse(harness.writes[0] ?? "{}") as { id?: number };
-  harness.send({ id: initialize.id, result: { userAgent: "openclaw/0.143.0 (macOS; test)" } });
+  harness.send({ id: initialize.id, result: { userAgent: "openclaw/0.146.1 (macOS; test)" } });
 }
 
 async function waitForRequest(
@@ -223,7 +225,7 @@ function threadStartResult(threadId = "thread-1") {
       status: { type: "idle" },
       path: null,
       cwd: "/repo",
-      cliVersion: "0.143.0",
+      cliVersion: "0.146.1",
       source: "unknown",
       agentNickname: null,
       agentRole: null,
@@ -286,6 +288,29 @@ describe("startCodexAttemptThread", () => {
 
     await expect(run).rejects.toThrow("Invalid bearer token");
     expect(harness.process.stdin.destroyed).toBe(true);
+  });
+
+  it("carries the session agent id into the startup client factory", async () => {
+    const clientFactory = vi.fn(
+      async (options: Parameters<CodexAppServerClientFactory>[0]) =>
+        await getLeasedSharedCodexAppServerClient(options),
+    );
+    const { harness, run } = startThreadWithHarness(5_000, new AbortController().signal, {
+      attemptClientFactory: () => clientFactory,
+    });
+    await answerInitialize(harness);
+    const threadStart = await waitForThreadStart(harness);
+    harness.send({
+      id: threadStart.id,
+      error: { code: -32000, message: "stop after startup" },
+    });
+
+    await expect(run).rejects.toThrow("stop after startup");
+    expect(clientFactory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "agent-1",
+      }),
+    );
   });
 
   it("rejects an expected artifact mismatch before any native thread request", async () => {
@@ -465,6 +490,7 @@ describe("startCodexAttemptThread", () => {
   });
 
   it("clears the shared app-server when startup abandons an in-flight thread request", async () => {
+    vi.useFakeTimers();
     const { harness, run } = startThreadWithHarness(500);
     const runError = run.then(
       () => undefined,
@@ -472,6 +498,7 @@ describe("startCodexAttemptThread", () => {
     );
     await answerInitialize(harness);
     await waitForThreadStart(harness);
+    await vi.advanceTimersByTimeAsync(500);
 
     const error = await runError;
     await vi.waitFor(() => expect(harness.stdinDestroyed).toBe(true), {
@@ -479,6 +506,7 @@ describe("startCodexAttemptThread", () => {
       timeout: 1_000,
     });
     expect(error).toBeInstanceOf(Error);
+    expect(isCodexAppServerStartupError(error, "timed_out")).toBe(true);
     expect((error as Error).message).toBe("codex app-server startup timed out");
     expect(harness.stdinDestroyed).toBe(true);
   });
@@ -512,6 +540,7 @@ describe("startCodexAttemptThread", () => {
   });
 
   it("closes the shared app-server when startup times out during initialize", async () => {
+    vi.useFakeTimers();
     const initializeTimeoutPluginConfig = {
       ...pluginConfig,
       appServer: { command: "codex", requestTimeoutMs: 1_000 },
@@ -526,9 +555,11 @@ describe("startCodexAttemptThread", () => {
 
     const initialize = await waitForRequest(harness, "initialize");
     expect(initialize.id).toBeDefined();
+    await vi.advanceTimersByTimeAsync(1_000);
 
     const error = await runError;
     expect(error).toBeInstanceOf(Error);
+    expect(isCodexAppServerStartupError(error, "timed_out")).toBe(true);
     expect((error as Error).message).toBe("codex app-server initialize timed out");
     await vi.waitFor(() => expect(harness.stdinDestroyed).toBe(true), {
       interval: 1,
@@ -589,6 +620,7 @@ describe("startCodexAttemptThread", () => {
         'import readline from "node:readline";',
         "const [requestLogPath, pidPath] = process.argv.slice(2);",
         'fs.writeFileSync(pidPath, String(process.pid), "utf8");',
+        'process.stderr.write("Error: failed to initialize sqlite state runtime token=secret-value\\n");',
         "const lines = readline.createInterface({ input: process.stdin });",
         'lines.on("line", (line) => {',
         "  const message = JSON.parse(line);",
@@ -615,7 +647,9 @@ describe("startCodexAttemptThread", () => {
         skipStartSpy: true,
       });
 
-      await expect(run).rejects.toThrow("codex app-server initialize timed out");
+      await expect(run).rejects.toThrow(
+        'codex app-server initialize timed out; stderr="Error: failed to initialize sqlite state runtime token=<redacted>"',
+      );
 
       const requestMethods = (await fs.readFile(requestLogPath, "utf8")).trim().split(/\r?\n/u);
       expect(requestMethods).toEqual(["initialize"]);
@@ -667,7 +701,9 @@ describe("startCodexAttemptThread", () => {
     });
 
     await expect(run).rejects.toThrow("stop after option capture");
-    expect(clientFactory).toHaveBeenCalledWith(expect.objectContaining({ preparedAuth }));
+    expect(clientFactory).toHaveBeenCalledWith(
+      expect.objectContaining({ preparedAuth, pluginConfig }),
+    );
     expect(clientFactory.mock.calls[0]?.[0]?.preparedAuth).toBe(preparedAuth);
     expect(clientFactory).not.toHaveBeenCalledWith(
       expect.objectContaining({ authProfileId: expect.anything() }),
@@ -675,6 +711,7 @@ describe("startCodexAttemptThread", () => {
   });
 
   it("closes a startup client that arrives after startup timeout", async () => {
+    vi.useFakeTimers();
     let observedFactoryOptions:
       | {
           onStartedClient?: (client: CodexAppServerClient) => void;
@@ -687,6 +724,10 @@ describe("startCodexAttemptThread", () => {
     const factoryDone = new Promise<void>((resolve) => {
       resolveFactoryDone = resolve;
     });
+    let releaseFactory: () => void = () => {};
+    const factoryRelease = new Promise<void>((resolve) => {
+      releaseFactory = resolve;
+    });
     const delayedFactoryPluginConfig = {
       ...pluginConfig,
       appServer: { command: "codex", requestTimeoutMs: 2_500 },
@@ -697,9 +738,7 @@ describe("startCodexAttemptThread", () => {
         try {
           factoryCalls += 1;
           observedFactoryOptions = options;
-          await new Promise<void>((resolve) => {
-            setTimeout(resolve, 250);
-          });
+          await factoryRelease;
           options?.onStartedClient?.(factoryHarness.client);
           return factoryHarness.client;
         } finally {
@@ -708,9 +747,15 @@ describe("startCodexAttemptThread", () => {
       },
     });
     const rejected = expect(run).rejects.toThrow("codex app-server startup timed out");
+    await vi.waitFor(() => expect(factoryCalls).toBe(1), { interval: 1 });
+    await vi.advanceTimersByTimeAsync(100);
 
-    await rejected;
-    await factoryDone;
+    try {
+      await rejected;
+    } finally {
+      releaseFactory();
+      await factoryDone;
+    }
     await vi.waitFor(() => expect(harness.stdinDestroyed).toBe(true), {
       interval: 1,
       timeout: 2_000,
@@ -738,11 +783,13 @@ describe("startCodexAttemptThread", () => {
 
     const error = await runError;
     expect(error).toBeInstanceOf(Error);
+    expect(isCodexAppServerStartupError(error, "aborted")).toBe(true);
     expect((error as Error).message).toBe("codex app-server startup aborted");
     expect(harness.process.stdin.destroyed).toBe(true);
   });
 
   it("continues with a deny-all apps patch when plugin discovery exceeds its shared deadline", async () => {
+    vi.useFakeTimers();
     const deadlinePluginConfig = {
       appServer: { command: "codex", requestTimeoutMs: 400 },
       codexPlugins: {
@@ -759,10 +806,8 @@ describe("startCodexAttemptThread", () => {
       pluginConfig: deadlinePluginConfig,
     });
     await answerInitialize(harness);
-    const pluginList = await waitForRequest(harness, "plugin/list");
-    expect(
-      readHarnessMessages(harness.writes).find((message) => message.id === pluginList.id),
-    ).toMatchObject({ method: "plugin/list", params: {} });
+    await waitForRequest(harness, "plugin/installed");
+    await vi.advanceTimersByTimeAsync(100);
 
     const threadStart = await waitForThreadStart(harness);
     const startMessage = readHarnessMessages(harness.writes).find(
@@ -783,6 +828,7 @@ describe("startCodexAttemptThread", () => {
   });
 
   it("clears the shared app-server when a startup RPC times out", async () => {
+    vi.useFakeTimers();
     const perRpcTimeoutPluginConfig = {
       ...pluginConfig,
       appServer: { command: "codex", requestTimeoutMs: 1_000 },
@@ -797,10 +843,14 @@ describe("startCodexAttemptThread", () => {
     );
     await answerInitialize(harness);
     await waitForRequest(harness, "plugin/list");
+    await vi.advanceTimersByTimeAsync(1_000);
 
     const error = await runError;
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toBe("plugin/list timed out");
+    expect(error).toBeInstanceOf(AgentHarnessPreflightError);
+    expect(error).toMatchObject({ scope: "harness" });
+    const cause = (error as Error).cause;
+    expect(isCodexAppServerRequestTimeoutError(cause)).toBe(true);
+    expect((cause as Error).message).toBe("plugin/list timed out");
     expect(harness.process.stdin.destroyed).toBe(true);
   });
 });

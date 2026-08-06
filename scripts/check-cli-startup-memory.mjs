@@ -5,9 +5,9 @@ import { spawnSync as defaultSpawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+import { pathToFileURL } from "node:url";
+import { resolveRepoRoot } from "./lib/repo-root.mjs";
+const repoRoot = resolveRepoRoot(import.meta.url);
 const tmpDir = process.env.TMPDIR || process.env.TEMP || process.env.TMP || os.tmpdir();
 const MAX_RSS_MARKER = "__OPENCLAW_MAX_RSS_KB__=";
 const DEFAULT_COMMAND_TIMEOUT_MS = 60_000;
@@ -99,9 +99,9 @@ function resolveDefaultLimitsMb(platform = process.platform) {
     // Plugin discovery is heavier than help, but must stay below the doctor/channel
     // runtime graph that an empty metadata-only invocation must not import.
     pluginsList: platform === "darwin" ? 500 : 400,
-    // Node 24 status startup sits near 400 MB; retain regression signal without
-    // failing on sub-megabyte runner RSS variance.
-    statusJson: 425,
+    // Node 24 status startup reaches ~430 MB on current Linux runner images;
+    // retain useful regression headroom without failing on allocator variance.
+    statusJson: 450,
     gatewayStatus: 500,
   };
 }

@@ -89,7 +89,7 @@ describe("OpenClawStdioClientTransport", () => {
 
     const closing = transport.close();
     await vi.advanceTimersByTimeAsync(2000);
-    expect(killProcessTreeMock).toHaveBeenCalledWith(4321);
+    expect(killProcessTreeMock).toHaveBeenCalledWith(4321, { detached: true });
 
     child.exitCode = 0;
     child.emit("close", 0);
@@ -108,13 +108,13 @@ describe("OpenClawStdioClientTransport", () => {
 
     const closing = transport.close();
     await vi.advanceTimersByTimeAsync(2000);
-    expect(killProcessTreeMock).toHaveBeenCalledWith(4321);
+    expect(killProcessTreeMock).toHaveBeenCalledWith(4321, { detached: true });
     expect(signalProcessTreeMock).not.toHaveBeenCalled();
 
     // killProcessTree's SIGKILL is .unref()'d (#86412); close() force-SIGKILLs
     // synchronously instead.
     await vi.advanceTimersByTimeAsync(2000);
-    expect(signalProcessTreeMock).toHaveBeenCalledWith(4321, "SIGKILL");
+    expect(signalProcessTreeMock).toHaveBeenCalledWith(4321, "SIGKILL", { detached: true });
 
     child.exitCode = 0;
     child.emit("close", 0);
@@ -134,7 +134,7 @@ describe("OpenClawStdioClientTransport", () => {
     const closing = transport.close();
     const repeatedClose = transport.close();
     const forced = transport.forceClose();
-    expect(signalProcessTreeMock).toHaveBeenCalledWith(4321, "SIGKILL");
+    expect(signalProcessTreeMock).toHaveBeenCalledWith(4321, "SIGKILL", { detached: true });
 
     child.exitCode = 0;
     child.emit("close", 0);
@@ -245,5 +245,24 @@ describe("OpenClawStdioClientTransport", () => {
 
     child.stderr.write("server diagnostic");
     expect(transport.stderr?.read()?.toString()).toBe("server diagnostic");
+  });
+
+  it("reports an oversized stdout frame without an unhandled error crash", async () => {
+    const child = new MockChildProcess();
+    spawnMock.mockReturnValue(child);
+
+    const transport = new OpenClawStdioClientTransport({ command: "npx" });
+    const onerror = vi.fn();
+    Object.assign(transport, { onerror });
+    const started = transport.start();
+    child.emit("spawn");
+    await started;
+
+    const oversized = Buffer.alloc(10 * 1024 * 1024 + 1, 0x20);
+    expect(() => child.stdout.emit("data", oversized)).not.toThrow();
+    expect(onerror).toHaveBeenCalledTimes(1);
+    const reported = onerror.mock.calls.at(0)?.at(0) as Error;
+    expect(reported).toBeInstanceOf(Error);
+    expect(reported.message).toMatch(/exceeded maximum size/);
   });
 });

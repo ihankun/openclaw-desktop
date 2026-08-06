@@ -7,6 +7,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
   type OfficialExternalPluginRepairHint,
   resolveMissingOfficialExternalChannelPluginRepairHint,
+  resolveMissingOfficialExternalChannelPluginRepairHints,
 } from "../../plugins/official-external-plugin-repair-hints.js";
 import { defaultRuntime } from "../../runtime.js";
 import { isAccountEnabled } from "../../shared/account-enabled.js";
@@ -16,6 +17,7 @@ import {
   isDeliverableMessageChannel,
   normalizeMessageChannel,
 } from "../../utils/message-channel.js";
+import { createDedupeCache } from "../dedupe.js";
 import { formatErrorMessage } from "../errors.js";
 import { resolveOutboundChannelPlugin } from "./channel-resolution.js";
 
@@ -90,15 +92,10 @@ function listConfiguredOfficialExternalRepairHints(
   if (!channels || typeof channels !== "object" || Array.isArray(channels)) {
     return [];
   }
-  return Object.keys(channels)
-    .filter((channelId) => isConfiguredChannel(cfg, channelId))
-    .map((channelId) =>
-      resolveMissingOfficialExternalChannelPluginRepairHint({
-        config: cfg,
-        channelId,
-      }),
-    )
-    .filter((hint): hint is OfficialExternalPluginRepairHint => Boolean(hint));
+  return resolveMissingOfficialExternalChannelPluginRepairHints({
+    config: cfg,
+    channelIds: Object.keys(channels).filter((channelId) => isConfiguredChannel(cfg, channelId)),
+  });
 }
 
 function formatMissingOfficialExternalChannelsMessage(
@@ -131,7 +128,12 @@ function formatMultipleConfiguredChannelsMessage(configured: readonly string[]):
   ].join(" ");
 }
 
-const loggedChannelSelectionErrors = new Set<string>();
+const CHANNEL_SELECTION_ERROR_DEDUPE_LIMIT = 1024;
+// Bound process-lifetime warning state; evicted plugin/account failures may log again.
+const loggedChannelSelectionErrors = createDedupeCache({
+  ttlMs: 0,
+  maxSize: CHANNEL_SELECTION_ERROR_DEDUPE_LIMIT,
+});
 
 function logChannelSelectionError(params: {
   pluginId: string;
@@ -141,10 +143,9 @@ function logChannelSelectionError(params: {
 }) {
   const message = formatErrorMessage(params.error);
   const key = `${params.pluginId}:${params.accountId}:${params.operation}:${message}`;
-  if (loggedChannelSelectionErrors.has(key)) {
+  if (loggedChannelSelectionErrors.check(key)) {
     return;
   }
-  loggedChannelSelectionErrors.add(key);
   defaultRuntime.error?.(
     `[channel-selection] ${params.pluginId}(${params.accountId}) ${params.operation} failed: ${message}`,
   );

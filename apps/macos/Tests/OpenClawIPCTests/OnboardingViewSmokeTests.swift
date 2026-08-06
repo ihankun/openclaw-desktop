@@ -32,6 +32,15 @@ private func makeOnboardingResumeDefaults() throws -> (UserDefaults, String) {
 @Suite(.serialized)
 @MainActor
 struct OnboardingViewSmokeTests {
+    @Test func `discovered gateway summary uses localized runtime strings`() {
+        #expect(
+            OnboardingView.remoteChoiceSubtitle(discoveredGatewayCount: 1) ==
+                "1 gateway found on your network — click to choose it.")
+        #expect(
+            OnboardingView.remoteChoiceSubtitle(discoveredGatewayCount: 2) ==
+                "2 gateways found on your network — click to choose one.")
+    }
+
     @Test func `onboarding view builds body`() {
         let state = AppState(preview: true)
         let view = OnboardingView(
@@ -73,14 +82,46 @@ struct OnboardingViewSmokeTests {
         #expect(short < preferred)
     }
 
-    @Test func `page order delegates setup after inference to OpenClaw`() {
-        let order = OnboardingView.pageOrder(
+    @Test func `permissions page scrolls when the onboarding window is short`() throws {
+        let state = AppState(preview: true)
+        let view = OnboardingView(state: state)
+        let hosting = NSHostingView(rootView: view.permissionsPage())
+        let contentHeight = OnboardingView.contentHeight(
+            for: OnboardingView.minimumWindowHeight,
+            usesCompactHero: false)
+        hosting.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: OnboardingView.windowWidth,
+            height: contentHeight)
+        hosting.layoutSubtreeIfNeeded()
+
+        let scrollView = try #require(Self.firstDescendant(of: NSScrollView.self, in: hosting))
+        #expect(contentHeight == 303)
+        #expect(scrollView.documentView != nil)
+    }
+
+    @Test func `configured flows end at AI setup and hand off to the dashboard`() {
+        // Everything after working inference (memory import, permissions,
+        // channels, hatch) belongs to the dashboard custodian onboarding.
+        #expect(OnboardingView.pageOrder(
             for: .local,
-            requiresCLIInstall: false)
-        #expect(!order.contains(4))
-        #expect(!order.contains(7))
-        #expect(!order.contains(8))
-        #expect(order.contains(3))
+            requiresCLIInstall: true) == [0, 1, 2, 3])
+        #expect(OnboardingView.pageOrder(
+            for: .local,
+            requiresCLIInstall: false) == [0, 1, 3])
+        #expect(OnboardingView.pageOrder(
+            for: .remote,
+            requiresCLIInstall: true) == [0, 1, 2, 3])
+        #expect(OnboardingView.pageOrder(
+            for: .remote,
+            requiresCLIInstall: false) == [0, 1, 3])
+    }
+
+    @Test func `set up later keeps the native ready page`() {
+        #expect(OnboardingView.pageOrder(
+            for: .unconfigured,
+            requiresCLIInstall: false) == [0, 1, 9])
     }
 
     @Test func `fresh local setup installs CLI before inference setup`() {
@@ -211,14 +252,13 @@ struct OnboardingViewSmokeTests {
         #expect(monitoredPage == view.activePageIndex)
     }
 
-    @Test func `gateway route reset returns later pages to inference setup`() throws {
+    @Test func `gateway route reset keeps the AI page blocking until inference verifies`() throws {
         let order = OnboardingView.pageOrder(
             for: .remote,
             requiresCLIInstall: false)
-        let permissionsCursor = try #require(order.firstIndex(of: 5))
         let aiCursor = try #require(order.firstIndex(of: 3))
         let resetCursor = OnboardingView.pageCursorAfterGatewayReset(
-            currentPage: permissionsCursor,
+            currentPage: order.count - 1,
             pageOrder: order,
             aiPageIndex: 3)
 
@@ -348,7 +388,9 @@ struct OnboardingViewSmokeTests {
         view.aiSetup.acceptVerifiedPendingInference(modelRef: "openai/gpt-5.5")
         let priorChat = view.systemAgentState.chat
         view.systemAgentState.isPresented = true
-        view.remoteProbeState = .ok(RemoteGatewayProbeSuccess(authSource: .sharedToken))
+        view.remoteProbeState = .ok(
+            view.remoteGatewayProbeInput,
+            RemoteGatewayProbeSuccess(authSource: .sharedToken))
         view.remoteAuthIssue = .tokenMismatch
 
         view.updateManualRemoteURL("wss://gateway-b.example.test")
@@ -505,5 +547,13 @@ struct OnboardingViewSmokeTests {
         #expect(Array(Capability.importanceOrdered.prefix(3))
             == [.appleScript, .accessibility, .screenRecording])
         #expect(Capability.importanceOrdered.last == Capability.location)
+    }
+
+    private static func firstDescendant<T: NSView>(of type: T.Type, in view: NSView) -> T? {
+        if let match = view as? T { return match }
+        for child in view.subviews {
+            if let match = self.firstDescendant(of: type, in: child) { return match }
+        }
+        return nil
     }
 }

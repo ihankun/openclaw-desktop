@@ -25,7 +25,6 @@ import {
   useNoBundledPlugins,
   writePlugin,
 } from "./loader.test-fixtures.js";
-import { testing as runtimeRegistryLoaderTesting } from "./runtime/runtime-registry-loader.js";
 
 export const getEmbeddingProvider = (id: string) => getRegisteredEmbeddingProvider(id)?.adapter;
 
@@ -34,11 +33,11 @@ export const listEmbeddingProviders = () =>
 
 export let cachedBundledTelegramDir = "";
 
-export let cachedBundledMemoryDir = "";
+let cachedBundledMemoryDir = "";
 
-export type GlobalHookRunner = NonNullable<ReturnType<typeof getGlobalHookRunner>>;
+type GlobalHookRunner = NonNullable<ReturnType<typeof getGlobalHookRunner>>;
 
-export type PluginStartupTraceDetail = {
+type PluginStartupTraceDetail = {
   name: string;
   metrics: ReadonlyArray<readonly [string, number | string]>;
 };
@@ -87,7 +86,7 @@ export function createDetachedTaskRuntimeStub(id: string): DetachedTaskLifecycle
   };
 }
 
-export const BUNDLED_TELEGRAM_PLUGIN_BODY = `module.exports = {
+const BUNDLED_TELEGRAM_PLUGIN_BODY = `module.exports = {
   id: "telegram",
   register(api) {
     api.registerChannel({
@@ -438,7 +437,7 @@ export function expectLoadedPluginProvenance(params: {
     params.warnings.some(
       (msg) =>
         msg.includes(params.pluginId) &&
-        msg.includes("loaded without install/load-path provenance"),
+        msg.includes("OpenClaw can't verify where this plugin came from"),
     ),
     params.scenario.label,
   ).toBe(params.expectWarning);
@@ -597,7 +596,7 @@ export function createErrorLogger(errors: string[]) {
   };
 }
 
-export function createEscapingEntryFixture(params: { id: string; sourceBody: string }) {
+function createEscapingEntryFixture(params: { id: string; sourceBody: string }) {
   const pluginDir = makeTempDir();
   const outsideDir = makeTempDir();
   const outsideEntry = path.join(outsideDir, "outside.cjs");
@@ -618,7 +617,7 @@ export function createEscapingEntryFixture(params: { id: string; sourceBody: str
   return { pluginDir, outsideEntry, linkedEntry };
 }
 
-export function resolveLoadedPluginSource(
+function resolveLoadedPluginSource(
   registry: ReturnType<typeof loadOpenClawPlugins>,
   pluginId: string,
 ) {
@@ -663,7 +662,6 @@ export function createSetupEntryChannelPluginFixture(params: {
   fullBlurb: string;
   setupBlurb: string;
   configured: boolean;
-  startupDeferConfiguredChannelFullLoadUntilAfterListen?: boolean;
   useBundledFullEntryContract?: boolean;
   bundledFullEntryId?: string;
   useBundledSetupEntryContract?: boolean;
@@ -694,13 +692,6 @@ export function createSetupEntryChannelPluginFixture(params: {
         openclaw: {
           extensions: ["./index.cjs"],
           setupEntry: "./setup-entry.cjs",
-          ...(params.startupDeferConfiguredChannelFullLoadUntilAfterListen
-            ? {
-                startup: {
-                  deferConfiguredChannelFullLoadUntilAfterListen: true,
-                },
-              }
-            : {}),
         },
       },
       null,
@@ -993,7 +984,6 @@ export function collectStartupTraceMetrics(
 export const globalAfterEach0 = () => {
   resetDiagnosticEventsForTest();
   clearRuntimeConfigSnapshot();
-  runtimeRegistryLoaderTesting.resetPluginRegistryLoadedForTests();
   resetPluginLoaderTestStateForTest();
 };
 

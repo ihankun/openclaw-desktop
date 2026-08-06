@@ -19,6 +19,7 @@ import type {
 import { resolveGatewayStartupRetryAfterMs } from "@openclaw/gateway-protocol/startup-unavailable";
 import { MIN_CLIENT_PROTOCOL_VERSION, PROTOCOL_VERSION } from "@openclaw/gateway-protocol/version";
 import { isLoopbackIpAddress, type ParsedIpAddress } from "@openclaw/net-policy/ip";
+import { isWssUrl } from "@openclaw/net-policy/url-protocol";
 import { WebSocket, type ClientOptions, type CertMeta } from "ws";
 import {
   isSensitiveUrlQueryParamName,
@@ -37,14 +38,19 @@ import {
 import { buildDeviceAuthPayloadV3 } from "./device-auth.js";
 import {
   GatewayProtocolClient,
-  GatewayProtocolRequestError,
   type GatewayProtocolCloseContext,
   type GatewayProtocolRequestOptions,
   type GatewayProtocolSocket,
   type GatewayProtocolSocketHandlers,
 } from "./protocol-client.js";
+import { GatewayProtocolRequestError } from "./protocol-request.js";
 import { shouldPauseGatewayReconnect } from "./reconnect-policy.js";
-import { resolveConnectChallengeTimeoutMs, resolveSafeTimeoutDelayMs } from "./timeouts.js";
+import {
+  DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS,
+  resolveConnectChallengeTimeoutMs,
+  resolvePreauthHandshakeTimeoutMs,
+  resolveSafeTimeoutDelayMs,
+} from "./timeouts.js";
 import { rawDataToString } from "./websocket-data.js";
 
 export type DeviceIdentity = {
@@ -243,6 +249,20 @@ export class GatewayClientRequestError extends GatewayProtocolRequestError {
   }
 }
 
+export class GatewayClientRequestTimeoutError extends Error {
+  readonly method: string;
+  readonly timeoutMs: number;
+  readonly requestSent: boolean;
+
+  constructor(params: { method: string; timeoutMs: number; requestSent: boolean }) {
+    super(`gateway request timeout for ${params.method}`);
+    this.name = "GatewayClientRequestTimeoutError";
+    this.method = params.method;
+    this.timeoutMs = params.timeoutMs;
+    this.requestSent = params.requestSent;
+  }
+}
+
 class GatewayClientTransientPreHelloCloseError extends Error {
   constructor() {
     super("gateway transient pre-hello clean close");
@@ -250,7 +270,9 @@ class GatewayClientTransientPreHelloCloseError extends Error {
   }
 }
 
-class GatewayClientTransportPolicyError extends Error {}
+class GatewayClientSocketFactoryConfigurationError extends Error {}
+
+class GatewayClientTransportPolicyError extends GatewayClientSocketFactoryConfigurationError {}
 
 const GATEWAY_CONNECT_ASSEMBLY_ERROR = Symbol("gateway.connectAssemblyError");
 
@@ -325,18 +347,6 @@ export type GatewayClientConnectionMetadata = {
   preauthHandshakeTimeoutMs?: number;
 };
 
-function readConnectChallengeTimeoutOverride(
-  opts: Pick<GatewayClientOptions, "connectChallengeTimeoutMs">,
-): number | undefined {
-  if (
-    typeof opts.connectChallengeTimeoutMs === "number" &&
-    Number.isFinite(opts.connectChallengeTimeoutMs)
-  ) {
-    return opts.connectChallengeTimeoutMs;
-  }
-  return undefined;
-}
-
 function isGatewayClientStoppedError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return message === "gateway client stopped" || message === "Error: gateway client stopped";
@@ -350,18 +360,6 @@ function formatGatewayClientErrorForLog(err: unknown): string {
       isSensitiveUrlQueryParamName(key) ? `${prefix}${key}=***` : match,
     );
   return redactedUrlLikeString;
-}
-
-function resolveGatewayClientConnectChallengeTimeoutMs(
-  opts: Pick<
-    GatewayClientOptions,
-    "connectChallengeTimeoutMs" | "env" | "preauthHandshakeTimeoutMs"
-  >,
-): number {
-  return resolveConnectChallengeTimeoutMs(readConnectChallengeTimeoutOverride(opts), {
-    env: opts.env,
-    configuredTimeoutMs: opts.preauthHandshakeTimeoutMs,
-  });
 }
 
 const FORCE_STOP_TERMINATE_GRACE_MS = 250;
@@ -407,18 +405,33 @@ export class GatewayClient {
     this.requestTimeoutMs =
       typeof opts.requestTimeoutMs === "number" && Number.isFinite(opts.requestTimeoutMs)
         ? resolveSafeTimeoutDelayMs(opts.requestTimeoutMs, { minMs: 0 })
-        : 30_000;
+        : DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS;
+    const connectChallengeTimeoutMs = resolveConnectChallengeTimeoutMs(
+      this.opts.connectChallengeTimeoutMs,
+      {
+        env: this.opts.env,
+        configuredTimeoutMs: this.opts.preauthHandshakeTimeoutMs,
+      },
+    );
     this.protocol = new GatewayProtocolClient<AssembledConnect>({
       createSocket: (handlers) => this.createSocket(handlers),
       createRequestId: randomUUID,
       createRequestError: (error) => new GatewayClientRequestError(error),
-      createRequestTimeoutError: (method) => new Error(`gateway request timeout for ${method}`),
+      createRequestTimeoutError: (method, timeoutMs, requestSent) =>
+        new GatewayClientRequestTimeoutError({ method, timeoutMs, requestSent }),
       createRequestAbortError: createGatewayRequestAbortError,
-      buildConnectPlan: ({ nonce }) => {
+      buildConnectPlan: ({ nonce, challengeTs }) => {
         if (!nonce) {
           throw new Error("gateway connect challenge missing nonce");
         }
-        return this.assembleConnectParams({ role: this.opts.role ?? "operator", nonce });
+        if (this.opts.deviceIdentity && challengeTs == null) {
+          throw new Error("gateway connect challenge timestamp invalid");
+        }
+        return this.assembleConnectParams({
+          role: this.opts.role ?? "operator",
+          nonce,
+          signedAtMs: challengeTs ?? Date.now(),
+        });
       },
       buildConnectParams: (assembled) => assembled.params,
       onConnectPlanError: (error) => {
@@ -460,12 +473,17 @@ export class GatewayClient {
         ),
       handshake: {
         mode: "require-challenge",
-        timeoutMs: resolveGatewayClientConnectChallengeTimeoutMs(this.opts),
+        timeoutMs: connectChallengeTimeoutMs,
         timeoutMessage: (elapsedMs) =>
-          `gateway connect challenge timeout (waited ${elapsedMs}ms, limit ${resolveGatewayClientConnectChallengeTimeoutMs(this.opts)}ms)`,
+          `gateway connect challenge timeout (waited ${elapsedMs}ms, limit ${connectChallengeTimeoutMs}ms)`,
       },
       reconnect: { initialMs: 1_000, multiplier: 2, maxMs: 30_000 },
       requestTimeoutMs: this.requestTimeoutMs,
+      shouldRetrySocketFactoryError: (error) =>
+        !(error instanceof GatewayClientSocketFactoryConfigurationError) &&
+        !(error instanceof SyntaxError) &&
+        !(error instanceof TypeError) &&
+        !(error instanceof RangeError),
       rethrowSocketFactoryError: (error) => error instanceof GatewayClientTransportPolicyError,
     });
   }
@@ -501,8 +519,11 @@ export class GatewayClient {
 
   private createSocket(handlers: GatewayProtocolSocketHandlers): GatewayProtocolSocket {
     const url = this.opts.url ?? DEFAULT_GATEWAY_CLIENT_URL;
-    if (this.opts.tlsFingerprint && !url.startsWith("wss://")) {
-      throw new Error("gateway tls fingerprint requires wss:// gateway url");
+    const usesTls = isWssUrl(url);
+    if (this.opts.tlsFingerprint && !usesTls) {
+      throw new GatewayClientSocketFactoryConfigurationError(
+        "gateway tls fingerprint requires wss:// gateway url",
+      );
     }
 
     const allowPrivateWs =
@@ -517,7 +538,7 @@ export class GatewayClient {
       } catch {
         // Use raw URL if parsing fails
       }
-      throw new Error(
+      throw new GatewayClientSocketFactoryConfigurationError(
         `SECURITY ERROR: Cannot connect to "${displayHost}" over plaintext ws://. ` +
           "Both credentials and chat data would be exposed to network interception. " +
           "Use wss:// for remote URLs. Safe defaults: keep gateway.bind=loopback and connect via SSH tunnel " +
@@ -530,11 +551,18 @@ export class GatewayClient {
     }
     // Allow node screen snapshots and other large responses.
     this.deps.beforeConnect();
+    // Challenge timeout arms only after `open`. Bound the opening handshake so a
+    // peer that accepts TCP without upgrading cannot hang createSocket forever.
+    const handshakeTimeoutMs = resolvePreauthHandshakeTimeoutMs({
+      env: this.opts.env,
+      configuredTimeoutMs: this.opts.preauthHandshakeTimeoutMs,
+    });
     const wsOptions: FingerprintCheckingClientOptions = {
       maxPayload: 25 * 1024 * 1024,
+      handshakeTimeout: handshakeTimeoutMs,
       ...(this.opts.origin ? { origin: this.opts.origin } : {}),
     };
-    if (url.startsWith("wss://") && this.opts.tlsFingerprint) {
+    if (usesTls && this.opts.tlsFingerprint) {
       wsOptions.rejectUnauthorized = false;
       wsOptions.checkServerIdentity = (_hostValue: string, cert: CertMeta) => {
         const fingerprintValue =
@@ -580,7 +608,7 @@ export class GatewayClient {
     this.transportValidated = false;
     ws.on("open", () => {
       handlers.open();
-      if (url.startsWith("wss://") && this.opts.tlsFingerprint) {
+      if (usesTls && this.opts.tlsFingerprint) {
         const tlsError = this.validateTlsFingerprint();
         if (tlsError) {
           handlers.error(tlsError);
@@ -711,8 +739,12 @@ export class GatewayClient {
     this.deps.logError(this.deps.redactForLog(message));
   }
 
-  private assembleConnectParams(params: { role: string; nonce: string }): AssembledConnect {
-    const { role, nonce } = params;
+  private assembleConnectParams(params: {
+    role: string;
+    nonce: string;
+    signedAtMs: number;
+  }): AssembledConnect {
+    const { role, nonce, signedAtMs } = params;
     // Auth selection is intentionally centralized: retry decisions depend on
     // whether a token was explicit, cached, or compatibility-derived.
     const selectedAuth = this.selectConnectAuth(role);
@@ -732,7 +764,6 @@ export class GatewayClient {
     }
 
     const auth = buildGatewayConnectAuth(selectedAuth);
-    const signedAtMs = Date.now();
     const scopes = resolveGatewayConnectScopes({
       requestedScopes: this.opts.scopes,
       usingStoredDeviceToken,
@@ -1194,6 +1225,7 @@ export class GatewayClient {
       expectFinal,
       timeoutMs,
       signal: opts?.signal,
+      onSent: opts?.onSent,
       onAccepted: opts?.onAccepted,
     });
   }

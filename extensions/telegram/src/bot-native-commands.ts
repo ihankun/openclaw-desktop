@@ -2,11 +2,16 @@
 import { randomUUID } from "node:crypto";
 import type { Bot, Context } from "grammy";
 import {
-  loadModelCatalog,
+  loadPreparedModelCatalog,
   resolveAgentConfig,
+  resolveAgentDir,
   resolveDefaultModelForAgent,
   resolveThinkingDefaultWithRuntimeCatalog,
 } from "openclaw/plugin-sdk/agent-runtime";
+import {
+  isChannelPartialDeliveryError,
+  type ChannelInboundTurnPlan,
+} from "openclaw/plugin-sdk/channel-inbound";
 import { resolveChannelStreamingBlockEnabled } from "openclaw/plugin-sdk/channel-outbound";
 import { resolveNativeCommandSessionTargets } from "openclaw/plugin-sdk/command-auth-native";
 import {
@@ -32,6 +37,7 @@ import type {
   TelegramGroupConfig,
   TelegramTopicConfig,
 } from "openclaw/plugin-sdk/config-contracts";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import { resolveMarkdownTableMode } from "openclaw/plugin-sdk/markdown-table-runtime";
 import { codexChannelLoginRuntime } from "openclaw/plugin-sdk/provider-auth-login-flow-runtime";
@@ -51,6 +57,7 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { escapeHtml } from "openclaw/plugin-sdk/text-utility-runtime";
 import { expandTelegramAllowFromWithAccessGroups } from "./access-groups.js";
 import { resolveTelegramAccount } from "./accounts.js";
 import { withTelegramApiErrorLogging } from "./api-logging.js";
@@ -116,9 +123,10 @@ import { getTopicName, resolveTopicNameCacheScope } from "./topic-name-cache.js"
 export { parseTelegramNativeCommandCallbackData } from "./native-command-callback-data.js";
 
 const EMPTY_RESPONSE_FALLBACK = "No response generated. Please try again.";
-const activeTelegramCodexLoginFlows = new Map<string, { expiresAt: number }>();
+const activeTelegramCodexLoginFlows = codexChannelLoginRuntime.createFlowRegistry();
 
 type TelegramNativeCommandContext = Context & { match?: string };
+
 type TelegramChunkMode = ReturnType<
   typeof import("openclaw/plugin-sdk/reply-dispatch-runtime").resolveChunkMode
 >;
@@ -157,6 +165,27 @@ type TelegramNativeCommandThreadContext = {
   threadSpec: ReturnType<typeof resolveTelegramThreadSpec>;
   threadParams: ReturnType<typeof buildTelegramThreadParams>;
 };
+
+type TelegramLoginDeviceCode = {
+  title: string;
+  code: string;
+  expiresInMinutes?: number;
+  message?: string;
+};
+
+// Telegram's inline-code entity provides the tap-to-copy affordance needed for
+// short-lived device codes; plain text and literal backticks do not.
+function formatTelegramLoginDeviceCode(params: TelegramLoginDeviceCode): string {
+  return [
+    `<b>${escapeHtml(params.title)}</b>`,
+    "",
+    ...(params.message ? [escapeHtml(params.message)] : []),
+    `Code: <code>${escapeHtml(params.code)}</code>`,
+    ...(params.expiresInMinutes
+      ? [`Code expires in ${params.expiresInMinutes} minutes. Never share it.`]
+      : []),
+  ].join("\n");
+}
 
 function resolveTelegramCodexLoginProviderInput(commandArgs: CommandArgs | undefined): string {
   const providerValue = commandArgs?.values?.provider;
@@ -220,20 +249,14 @@ type TelegramNativeCommandRuntime = Awaited<ReturnType<typeof loadTelegramNative
 
 function resolveTelegramCommandSessionFile(params: {
   agentId: string;
-  sessionFile?: string;
   sessionId: string;
   storePath: string;
 }): string {
-  const sqliteMarker = formatSqliteSessionFileMarker({
+  return formatSqliteSessionFileMarker({
     agentId: params.agentId,
     sessionId: params.sessionId,
     storePath: params.storePath,
   });
-  const explicitSessionFile = params.sessionFile?.trim();
-  if (explicitSessionFile === sqliteMarker) {
-    return explicitSessionFile;
-  }
-  return sqliteMarker;
 }
 
 function resolveTelegramProgressPlaceholder(command: {
@@ -265,7 +288,6 @@ async function resolveTelegramCommandTranscriptContext(params: {
     const sessionId = entry?.sessionId?.trim() || randomUUID();
     const sessionFile = resolveTelegramCommandSessionFile({
       agentId: params.agentId,
-      sessionFile: entry?.sessionFile,
       sessionId,
       storePath,
     });
@@ -436,7 +458,7 @@ async function resolveTelegramThinkMenuCurrentLevel(params: {
   model?: string;
   agentRuntime?: string;
   thinkingLevel?: string;
-  catalog: Awaited<ReturnType<typeof loadModelCatalog>>;
+  catalog: Awaited<ReturnType<typeof loadPreparedModelCatalog>>;
 }): Promise<string> {
   const explicit = normalizeOptionalString(params.thinkingLevel);
   if (explicit) {
@@ -457,7 +479,7 @@ async function resolveTelegramThinkMenuCurrentLevel(params: {
     provider: params.provider ?? defaultModel.provider,
     model: params.model ?? defaultModel.model,
     agentRuntime: params.agentRuntime,
-    loadModelCatalog: async () => params.catalog,
+    loadRuntimeCatalog: async () => params.catalog,
   });
 }
 
@@ -657,7 +679,10 @@ type RegisterTelegramNativeCommandsParams = {
   ) => TelegramResolvedGroupConfig;
   shouldSkipUpdate: (ctx: TelegramUpdateKeyContext) => boolean;
   telegramDeps?: TelegramNativeCommandDeps;
-  opts: Pick<TelegramBotOptions, "token" | "allowFrom" | "groupAllowFrom" | "replyToMode">;
+  opts: Pick<
+    TelegramBotOptions,
+    "token" | "allowFrom" | "groupAllowFrom" | "replyToMode" | "accountAbortSignal"
+  >;
 };
 
 async function resolveTelegramCommandAuth(params: {
@@ -811,12 +836,12 @@ async function resolveTelegramCommandAuth(params: {
     senderId,
     senderUsername,
     resolveGroupPolicy,
-    enforcePolicy: cfg.commands?.useAccessGroups !== false,
+    enforcePolicy: true,
     useTopicAndGroupOverrides: false,
     enforceAllowlistAuthorization: requireAuth && !commandsAllowFromConfigured,
     allowEmptyAllowlistEntries: true,
     requireSenderForAllowlistAuthorization: true,
-    checkChatAllowlist: cfg.commands?.useAccessGroups !== false,
+    checkChatAllowlist: true,
   });
   if (!policyAccess.allowed) {
     if (policyAccess.reason === "group-policy-disabled") {
@@ -1273,6 +1298,28 @@ export const registerTelegramNativeCommands = ({
               fn: () => bot.api.sendMessage(chatId, text, threadParams),
             });
           };
+          const sendLoginDeviceCode = async (params: TelegramLoginDeviceCode) => {
+            await withTelegramApiErrorLogging({
+              operation: "sendMessage",
+              runtime,
+              fn: () =>
+                bot.api.sendMessage(chatId, formatTelegramLoginDeviceCode(params), {
+                  ...threadParams,
+                  parse_mode: "HTML",
+                }),
+            });
+          };
+          const sendLoginResultMessage = async (text: string) => {
+            await telegramDeps.sendMessageTelegram(
+              buildTelegramRoutingTarget(chatId, threadSpec),
+              text,
+              {
+                cfg: runtimeCfg,
+                token: opts.token,
+                accountId: route.accountId,
+              },
+            );
+          };
           if (
             !senderIsOwner ||
             !codexChannelLoginRuntime.hasConfiguredCommandOwnerAllowlist(runtimeCfg)
@@ -1312,123 +1359,158 @@ export const registerTelegramNativeCommands = ({
             );
             return;
           }
-          try {
+          const flowSignal = opts.accountAbortSignal
+            ? AbortSignal.any([reservation.record.signal, opts.accountAbortSignal])
+            : reservation.record.signal;
+          const deviceCodeDelivered = createDeferred<void>();
+          // Device-code delivery releases Telegram's serialized chat lane. The
+          // reservation and account signal still own polling through completion.
+          const completion = (async () => {
+            const sessionSwitchFailedMessage =
+              "Codex login completed, but this Telegram session could not switch to the newly authenticated profile. Retry `/login codex`, or select the profile manually.";
+            let terminalMessage: string;
             const loginFlow =
               telegramDeps.runModelsAuthLoginFlow ??
               defaultTelegramNativeCommandDeps.runModelsAuthLoginFlow;
-            if (!loginFlow) {
-              throw new Error("Codex login flow is unavailable.");
-            }
-            const nativeCommandRuntime = await loadTelegramNativeCommandRuntime();
-            const targetSessionKey = resolveCommandTargetSessionKey({
-              runtimeCfg,
-              route,
-              chatId,
-              isGroup,
-              senderId,
-              threadSpec,
-              botHasTopicsEnabled: resolveTelegramBotHasTopicsEnabled(ctx.me),
-              resolveThreadSessionKeys: nativeCommandRuntime.resolveThreadSessionKeys,
-            });
-            const targetSessionEntry = nativeCommandRuntime.getSessionEntry({
-              agentId: route.agentId,
-              sessionKey: targetSessionKey,
-            });
-            const loginResult = await codexChannelLoginRuntime.runDeviceLoginFlow({
-              runLoginFlow: loginFlow,
-              provider: loginProvider,
-              agentId: route.agentId,
-              config: runtimeCfg,
-              runtime,
-              sendMessage: sendLoginMessage,
-              unsupportedPromptMessage:
-                "Telegram /login supports only fixed Codex device-code auth.",
-            });
-            const nextProfileId = loginResult.profiles.find(
-              (profile) => profile.provider === loginProvider,
-            )?.profileId;
-            if (!nextProfileId) {
-              await sendLoginMessage(
-                "Codex login completed, but this Telegram session could not switch to the newly authenticated profile. Retry `/login codex`, or select the profile manually.",
-              );
-              return;
-            }
-            const needsSessionUpdate =
-              targetSessionEntry &&
-              (targetSessionEntry.authProfileOverride !== nextProfileId ||
-                targetSessionEntry.authProfileOverrideSource !== "user" ||
-                targetSessionEntry.authProfileOverrideCompactionCount !== undefined);
-            if (targetSessionEntry) {
-              try {
+            try {
+              if (!loginFlow) {
+                throw new Error("Codex login flow is unavailable.");
+              }
+              const nativeCommandRuntime = await loadTelegramNativeCommandRuntime();
+              const targetSessionKey = resolveCommandTargetSessionKey({
+                runtimeCfg,
+                route,
+                chatId,
+                isGroup,
+                senderId,
+                threadSpec,
+                botHasTopicsEnabled: resolveTelegramBotHasTopicsEnabled(ctx.me),
+                resolveThreadSessionKeys: nativeCommandRuntime.resolveThreadSessionKeys,
+              });
+              const targetSessionEntryAtStart = nativeCommandRuntime.getSessionEntry({
+                agentId: route.agentId,
+                sessionKey: targetSessionKey,
+              });
+              const loginResult = await codexChannelLoginRuntime.runDeviceLoginFlow({
+                runLoginFlow: loginFlow,
+                provider: loginProvider,
+                agentId: route.agentId,
+                config: runtimeCfg,
+                runtime,
+                signal: flowSignal,
+                sendMessage: sendLoginMessage,
+                sendDeviceCode: async (deviceCode) => {
+                  flowSignal.throwIfAborted();
+                  await sendLoginDeviceCode(deviceCode);
+                  flowSignal.throwIfAborted();
+                  deviceCodeDelivered.resolve();
+                },
+                unsupportedPromptMessage:
+                  "Telegram /login supports only fixed Codex device-code auth.",
+              });
+              flowSignal.throwIfAborted();
+              const nextProfileId = loginResult.profiles.find(
+                (profile) => profile.provider === loginProvider,
+              )?.profileId;
+              terminalMessage = "Codex login complete. Try your request again now.";
+              if (!nextProfileId) {
+                terminalMessage = sessionSwitchFailedMessage;
+              } else {
                 const storePath = resolveStorePath(runtimeCfg.session?.store, {
                   agentId: route.agentId,
                 });
-                let snapshotMatched = false;
-                const persisted = await updateSessionStoreEntry({
-                  sessionKey: targetSessionKey,
-                  storePath,
-                  requireWriteSuccess: true,
-                  skipMaintenance: true,
-                  update: (entry) => {
-                    if (
-                      entry.sessionId !== targetSessionEntry.sessionId ||
-                      entry.authProfileOverride !== targetSessionEntry.authProfileOverride ||
-                      entry.authProfileOverrideSource !==
-                        targetSessionEntry.authProfileOverrideSource ||
-                      entry.authProfileOverrideCompactionCount !==
-                        targetSessionEntry.authProfileOverrideCompactionCount
-                    ) {
-                      return null;
-                    }
-                    snapshotMatched = true;
-                    return needsSessionUpdate
-                      ? {
-                          authProfileOverride: nextProfileId,
-                          authProfileOverrideSource: "user",
-                          authProfileOverrideCompactionCount: undefined,
-                        }
-                      : null;
-                  },
-                });
-                if (
-                  !snapshotMatched ||
-                  !persisted ||
-                  persisted.authProfileOverride !== nextProfileId ||
-                  persisted.authProfileOverrideSource !== "user" ||
-                  persisted.authProfileOverrideCompactionCount !== undefined
-                ) {
-                  await sendLoginMessage(
-                    "Codex login completed, but this Telegram session could not switch to the newly authenticated profile. Retry `/login codex`, or select the profile manually.",
+                let entryObserved = false;
+                let adoptionAllowed = false;
+                try {
+                  const persisted = await updateSessionStoreEntry({
+                    sessionKey: targetSessionKey,
+                    storePath,
+                    requireWriteSuccess: true,
+                    skipMaintenance: true,
+                    update: (entry) => {
+                      entryObserved = true;
+                      const source =
+                        entry.authProfileOverrideSource ??
+                        (typeof entry.authProfileOverrideCompactionCount === "number"
+                          ? "auto"
+                          : entry.authProfileOverride
+                            ? "user"
+                            : undefined);
+                      if (
+                        flowSignal.aborted ||
+                        (targetSessionEntryAtStart
+                          ? entry.sessionId !== targetSessionEntryAtStart.sessionId ||
+                            entry.authProfileOverride !==
+                              targetSessionEntryAtStart.authProfileOverride ||
+                            entry.authProfileOverrideSource !==
+                              targetSessionEntryAtStart.authProfileOverrideSource ||
+                            entry.authProfileOverrideCompactionCount !==
+                              targetSessionEntryAtStart.authProfileOverrideCompactionCount
+                          : source === "user" && entry.authProfileOverride !== nextProfileId)
+                      ) {
+                        return null;
+                      }
+                      adoptionAllowed = true;
+                      return entry.authProfileOverride !== nextProfileId ||
+                        entry.authProfileOverrideSource !== "user" ||
+                        entry.authProfileOverrideCompactionCount !== undefined
+                        ? {
+                            authProfileOverride: nextProfileId,
+                            authProfileOverrideSource: "user",
+                            authProfileOverrideCompactionCount: undefined,
+                          }
+                        : null;
+                    },
+                  });
+                  flowSignal.throwIfAborted();
+                  if (
+                    entryObserved &&
+                    (!adoptionAllowed ||
+                      !persisted ||
+                      persisted.authProfileOverride !== nextProfileId ||
+                      persisted.authProfileOverrideSource !== "user" ||
+                      persisted.authProfileOverrideCompactionCount !== undefined)
+                  ) {
+                    terminalMessage = sessionSwitchFailedMessage;
+                  }
+                } catch (error) {
+                  flowSignal.throwIfAborted();
+                  runtime.error?.(
+                    danger(
+                      `telegram /login codex completed but failed to update session auth profile: ${String(
+                        error,
+                      )}`,
+                    ),
                   );
-                  return;
+                  terminalMessage = sessionSwitchFailedMessage;
                 }
-              } catch (error) {
-                runtime.error?.(
-                  danger(
-                    `telegram /login codex completed but failed to update session auth profile: ${String(
-                      error,
-                    )}`,
-                  ),
-                );
-                await sendLoginMessage(
-                  "Codex login completed, but this Telegram session could not switch to the newly authenticated profile. Retry `/login codex`, or select the profile manually.",
-                );
+              }
+            } catch (error) {
+              if (flowSignal.aborted) {
                 return;
               }
+              runtime.error?.(danger(`telegram /login codex failed: ${String(error)}`));
+              terminalMessage =
+                "Codex login did not complete. Send `/login codex` to request a new code.";
             }
-            await sendLoginMessage("Codex login complete. Try your request again now.");
-          } catch {
-            runtime.error?.(danger("telegram /login codex failed"));
-            await sendLoginMessage(
-              "Codex login did not complete. Send `/login codex` to request a new code.",
-            );
-          } finally {
+            if (flowSignal.aborted) {
+              return;
+            }
+            try {
+              await sendLoginResultMessage(terminalMessage);
+            } catch (error) {
+              runtime.error?.(
+                danger(`telegram /login codex result notification failed: ${String(error)}`),
+              );
+            }
+          })().finally(() => {
             codexChannelLoginRuntime.releaseFlow({
               flows: activeTelegramCodexLoginFlows,
               flowKey,
               record: reservation.record,
             });
-          }
+          });
+          await Promise.race([deviceCodeDelivered.promise, completion]);
           return;
         }
 
@@ -1493,7 +1575,12 @@ export const registerTelegramNativeCommands = ({
         // Native /think must not wait on provider discovery; persisted rows retain its metadata.
         const menuModelCatalog =
           commandDefinition?.key === "think" && menuNeedsModelContext
-            ? await loadModelCatalog({ config: runtimeCfg, readOnly: true })
+            ? await loadPreparedModelCatalog({
+                config: runtimeCfg,
+                agentId: route.agentId,
+                agentDir: resolveAgentDir(runtimeCfg, route.agentId),
+                readOnly: true,
+              })
             : undefined;
         const menu = commandDefinition
           ? resolveCommandArgMenu({
@@ -1644,38 +1731,53 @@ export const registerTelegramNativeCommands = ({
           OriginatingChannel: "telegram" as const,
           OriginatingTo: originatingTo,
         });
-        await nativeCommandRuntime.recordInboundSessionMetaSafe({
-          cfg: runtimeCfg,
-          agentId: route.agentId,
-          sessionKey: commandTargetSessionKey,
-          ctx: ctxPayload,
-          onError: (err) =>
-            runtime.error?.(danger(`telegram slash: failed updating session meta: ${String(err)}`)),
-        });
-
         const disableBlockStreaming =
           resolveTelegramNativeCommandDisableBlockStreaming(runtimeTelegramCfg);
         const deliveryState = {
           delivered: false,
           skippedNonSilent: 0,
+          failedNonSilent: 0,
         };
+        let finalReplyOutcome: "accepted" | "failed" | "suppressed" | undefined;
 
-        const { createChannelMessageReplyPipeline, deliverReplies } =
-          await loadTelegramNativeCommandDeliveryRuntime();
-        const { onModelSelected, ...replyPipeline } = createChannelMessageReplyPipeline({
+        const { deliverReplies } = await loadTelegramNativeCommandDeliveryRuntime();
+        let recordSessionMetaTask: Promise<unknown> | undefined;
+
+        const turnPlan: ChannelInboundTurnPlan<"provider_message_sending"> = {
           cfg: runtimeCfg,
-          agentId: route.agentId,
           channel: "telegram",
           accountId: route.accountId,
-        });
-
-        await telegramDeps.dispatchReplyWithBufferedBlockDispatcher({
-          ctx: ctxPayload,
-          cfg: runtimeCfg,
+          route: {
+            agentId: route.agentId,
+            sessionKey: commandSessionKey,
+          },
+          ctxPayload,
+          record: {
+            sessionKey: commandTargetSessionKey,
+            trackSessionMetaTask: (task) => {
+              recordSessionMetaTask = task;
+            },
+            onRecordError: (err) =>
+              runtime.error?.(
+                danger(`telegram slash: failed updating session meta: ${String(err)}`),
+              ),
+          },
+          // Native commands historically persisted target metadata before dispatch.
+          // Preserve that ordering while the shared recorder owns the write.
+          afterRecord: async () => {
+            await recordSessionMetaTask;
+          },
+          replyPipeline: {},
           dispatcherOptions: {
-            ...replyPipeline,
             beforeDeliver: async (payload) => payload,
-            deliver: async (payload, _info) => {
+            onSkip: (_payload, info) => {
+              if (info.reason !== "silent") {
+                deliveryState.skippedNonSilent += 1;
+              }
+            },
+          },
+          delivery: {
+            deliverWithProviderMessageSending: async (payload) => {
               if (
                 shouldSuppressLocalTelegramExecApprovalPrompt({
                   cfg: runtimeCfg,
@@ -1684,7 +1786,10 @@ export const registerTelegramNativeCommands = ({
                 })
               ) {
                 deliveryState.delivered = true;
-                return;
+                return {
+                  visibleReplySent: false,
+                  suppression: { reason: "no_visible_result" },
+                };
               }
               const result = await deliverReplies({
                 replies: [
@@ -1701,23 +1806,58 @@ export const registerTelegramNativeCommands = ({
               if (result.delivered) {
                 deliveryState.delivered = true;
               }
+              return result.delivered
+                ? { visibleReplySent: true }
+                : {
+                    visibleReplySent: false,
+                    suppression: { reason: "no_visible_result" as const },
+                  };
             },
-            onSkip: (_payload, info) => {
-              if (info.reason !== "silent") {
-                deliveryState.skippedNonSilent += 1;
+            onDelivered: (_payload, info, result) => {
+              const reason = result?.suppression?.reason;
+              if (info.kind === "final" && result?.visibleReplySent) {
+                finalReplyOutcome = "accepted";
+              }
+              if (
+                info.kind === "final" &&
+                finalReplyOutcome !== "failed" &&
+                (reason === "cancelled_by_reply_payload_sending_hook" ||
+                  reason === "empty_after_reply_payload_sending_hook")
+              ) {
+                finalReplyOutcome = "suppressed";
               }
             },
             onError: (err, info) => {
+              deliveryState.failedNonSilent += 1;
+              const partialDelivery = isChannelPartialDeliveryError(err);
+              if (partialDelivery) {
+                deliveryState.delivered = true;
+                logVerbose("telegram slash reply partially delivered before failure");
+              }
+              if (info.kind === "final") {
+                // A failed final outweighs any earlier suppression until a final delivers.
+                finalReplyOutcome = partialDelivery ? "accepted" : "failed";
+              }
               runtime.error?.(danger(`telegram slash ${info.kind} reply failed: ${String(err)}`));
             },
           },
           replyOptions: {
             skillFilter,
             disableBlockStreaming,
-            onModelSelected,
           },
-        });
-        if (!deliveryState.delivered && deliveryState.skippedNonSilent > 0) {
+        };
+        const turnResult = await (
+          telegramDeps.dispatchChannelInboundTurn ??
+          defaultTelegramNativeCommandDeps.dispatchChannelInboundTurn
+        )(turnPlan);
+        if (
+          !deliveryState.delivered &&
+          finalReplyOutcome !== "suppressed" &&
+          (deliveryState.skippedNonSilent > 0 || deliveryState.failedNonSilent > 0) &&
+          (!turnResult.dispatched ||
+            turnResult.dispatchResult.sourceReplyDeliveryMode !== "message_tool_only" ||
+            deliveryState.failedNonSilent > 0)
+        ) {
           await deliverReplies({
             replies: [{ text: EMPTY_RESPONSE_FALLBACK }],
             ...deliveryBaseOptions,

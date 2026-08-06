@@ -87,8 +87,14 @@ export type EnvironmentCreateParams = {
   idempotencyKey: string;
 };
 
+export type WorkerEnvironmentProfileSummary = {
+  id: string;
+  providerId: string;
+};
+
 export type EnvironmentsListResult = {
   environments: EnvironmentSummary[];
+  profiles?: WorkerEnvironmentProfileSummary[];
 };
 
 export type WorkspaceSelection = {
@@ -341,7 +347,12 @@ export type SessionCreateParams = {
   agentId?: string;
   label?: string;
   model?: string;
+  thinkingLevel?: string;
   parentSessionKey?: string;
+  /** Emit command and lifecycle hooks for parent-linked creation. */
+  emitCommandHooks?: boolean;
+  /** Whether a distinct child terminates its parent; requires command hooks. */
+  succeedsParent?: boolean;
   task?: string;
   message?: string;
   attachments?: unknown[];
@@ -368,7 +379,7 @@ export type RunCreateParams = AgentRunParams;
 
 export type AgentsCreateParams = {
   name: string;
-  workspace: string;
+  workspace?: string;
   model?: string;
   emoji?: string;
   avatar?: string;
@@ -378,7 +389,7 @@ export type AgentsUpdateParams = {
   agentId: string;
   name?: string;
   workspace?: string;
-  model?: string;
+  model?: string | null;
   emoji?: string;
   avatar?: string;
 };

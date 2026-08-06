@@ -37,7 +37,7 @@ async function stopServer(child: FixtureServerChild) {
     child.once("exit", () => resolve());
   });
   child.kill("SIGTERM");
-  await Promise.race([exited, delay(1_000)]);
+  await Promise.race([exited, delay(1_000, undefined, { ref: false })]);
   if (child.exitCode === null && child.signalCode === null) {
     child.kill("SIGKILL");
     await exited;
@@ -56,7 +56,8 @@ async function startFixtureServer(profile: string) {
   const readStderr = collectStream(child.stderr);
   servers.push(child);
 
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  // Preserve the 2.5-second startup budget while detecting the port file sooner.
+  for (let attempt = 0; attempt < 500; attempt += 1) {
     if (existsSync(portFile)) {
       const port = Number(readFileSync(portFile, "utf8"));
       if (Number.isInteger(port) && port > 0) {
@@ -66,7 +67,7 @@ async function startFixtureServer(profile: string) {
     if (child.exitCode !== null) {
       throw new Error(`fixture server exited early: stdout=${readStdout()} stderr=${readStderr()}`);
     }
-    await delay(25);
+    await delay(5);
   }
 
   throw new Error(`fixture server did not write a port: stderr=${readStderr()}`);
@@ -121,7 +122,63 @@ describe("ClawHub fixture server", () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(
-      "usage: clawhub-fixture-server.cjs <kitchen-sink-plugin|plugins> <port-file>",
+      "usage: clawhub-fixture-server.cjs <catalog-search|kitchen-sink-plugin|plugins> <port-file>",
     );
+  });
+
+  it("serves separate plugin-family and skill search fixtures", async () => {
+    const { baseUrl } = await startFixtureServer("catalog-search");
+
+    const codePlugins = await fetchJson(
+      baseUrl,
+      "/api/v1/packages/search?q=calendar&family=code-plugin&limit=5",
+    );
+    expect(codePlugins.results).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          score: 4,
+          package: expect.objectContaining({
+            name: "@acme/calendar",
+            family: "code-plugin",
+          }),
+        }),
+      ]),
+    );
+
+    const bundlePlugins = await fetchJson(
+      baseUrl,
+      "/api/v1/packages/search?q=calendar&family=bundle-plugin&limit=5",
+    );
+    expect(bundlePlugins.results).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          score: 12,
+          package: expect.objectContaining({
+            name: "@acme/calendar",
+            family: "bundle-plugin",
+          }),
+        }),
+      ]),
+    );
+
+    const skills = await fetchJson(baseUrl, "/api/v1/search?q=calendar&limit=5");
+    expect(skills.results).toEqual([
+      expect.objectContaining({
+        score: 99,
+        slug: "calendar-skill",
+      }),
+    ]);
+
+    const empty = await fetchJson(
+      baseUrl,
+      "/api/v1/packages/search?q=empty&family=code-plugin&limit=5",
+    );
+    expect(empty).toEqual({ results: [] });
+
+    const unavailable = await fetch(
+      `${baseUrl}/api/v1/packages/search?q=unavailable&family=code-plugin&limit=5`,
+    );
+    expect(unavailable.status).toBe(503);
+    await expect(unavailable.json()).resolves.toEqual({ error: "catalog unavailable" });
   });
 });

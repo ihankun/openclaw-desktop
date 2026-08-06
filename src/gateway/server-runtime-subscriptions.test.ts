@@ -1,6 +1,11 @@
 // Tests for gateway runtime subscription wiring.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  configureExecutionIdentityAdmissionSink,
+  enqueueExecutionIdentityContextAtAdmission,
+  hasExecutionIdentityAdmissionSink,
+} from "../audit/execution-identity-admission.js";
+import {
   emitAgentAuditEvent,
   emitAgentEvent,
   resetAgentEventsForTest,
@@ -23,6 +28,13 @@ import {
 } from "./server-chat-state.js";
 import type { TaskEventPayload } from "./server-methods/task-summary.js";
 
+function waitForFast<T>(
+  callback: () => T | Promise<T>,
+  options: { timeout?: number; interval?: number } = {},
+) {
+  return vi.waitFor(callback, { interval: 1, ...options });
+}
+
 const warn = vi.fn();
 const mockLog: SubsystemLogger = {
   subsystem: "gateway-test",
@@ -42,7 +54,15 @@ const auditTestState = vi.hoisted(() => ({
   messageMode: "off" as "off" | "direct" | "all",
   created: 0,
   recorded: 0,
+  identityRecorded: 0,
   stopped: 0,
+}));
+const agentEventHandlerMocks = vi.hoisted(() => ({
+  create: vi.fn(),
+}));
+const transcriptBroadcastMocks = vi.hoisted(() => ({
+  useActualHandler: false,
+  readMessageCount: vi.fn(),
 }));
 
 vi.mock("../audit/audit-config.js", () => ({
@@ -59,6 +79,10 @@ vi.mock("../audit/audit-recorder.js", () => ({
       }),
       recordTool: vi.fn(),
       recordMessage: vi.fn(),
+      recordExecutionIdentity: vi.fn(() => {
+        auditTestState.identityRecorded += 1;
+        return true;
+      }),
       stop: vi.fn(async () => {
         auditTestState.stopped += 1;
       }),
@@ -66,22 +90,41 @@ vi.mock("../audit/audit-recorder.js", () => ({
   },
 }));
 
-vi.mock("./server-chat.js", () => {
-  throw new Error("server-chat lazy load failure");
-});
+vi.mock("./server-chat.js", () => ({
+  createAgentEventHandler: (...args: unknown[]) => agentEventHandlerMocks.create(...args),
+}));
 
 vi.mock("./server-session-key.js", () => ({
   resolveSessionKeyForRun: () => "agent:main:main",
 }));
 
-vi.mock("./server-session-events.js", () => ({
-  createTranscriptUpdateBroadcastHandler: () => () => {
-    throw new Error("transcript handler failure");
-  },
-  createLifecycleEventBroadcastHandler: () => () => {
-    throw new Error("lifecycle handler failure");
-  },
-}));
+vi.mock("./session-transcript-readers.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./session-transcript-readers.js")>();
+  return {
+    ...actual,
+    readSessionMessageCountAsync: transcriptBroadcastMocks.readMessageCount,
+  };
+});
+
+vi.mock("./server-session-events.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./server-session-events.js")>();
+  return {
+    ...actual,
+    createTranscriptUpdateBroadcastHandler: (
+      ...args: Parameters<typeof actual.createTranscriptUpdateBroadcastHandler>
+    ) => {
+      if (transcriptBroadcastMocks.useActualHandler) {
+        return actual.createTranscriptUpdateBroadcastHandler(...args);
+      }
+      return () => {
+        throw new Error("transcript handler failure");
+      };
+    },
+    createLifecycleEventBroadcastHandler: () => () => {
+      throw new Error("lifecycle handler failure");
+    },
+  };
+});
 
 const { startGatewayEventSubscriptions } = await import("./server-runtime-subscriptions.js");
 type SubscriptionParams = Parameters<typeof startGatewayEventSubscriptions>[0];
@@ -111,7 +154,13 @@ describe("startGatewayEventSubscriptions", () => {
     auditTestState.messageMode = "off";
     auditTestState.created = 0;
     auditTestState.recorded = 0;
+    auditTestState.identityRecorded = 0;
     auditTestState.stopped = 0;
+    transcriptBroadcastMocks.useActualHandler = false;
+    transcriptBroadcastMocks.readMessageCount.mockReset();
+    agentEventHandlerMocks.create.mockReset().mockImplementation(() => {
+      throw new Error("server-chat lazy load failure");
+    });
     installInMemoryTaskRegistryRuntime();
   });
 
@@ -123,16 +172,35 @@ describe("startGatewayEventSubscriptions", () => {
     void unsubs?.taskUnsub();
     resetAgentEventsForTest();
     resetTaskRegistryForTests({ persist: false });
+    configureExecutionIdentityAdmissionSink(() => false)();
   });
 
   it("records audit events by default and stops the recorder on unsubscribe", async () => {
     unsubs = startGatewayEventSubscriptions(createParams());
 
     expect(auditTestState.created).toBe(1);
-    emitAgentAuditEvent({ runId: "enabled-audit", stream: "lifecycle", data: { phase: "start" } });
+    emitAgentAuditEvent({
+      runId: "enabled-audit",
+      stream: "lifecycle",
+      data: { phase: "start", startedAt: 1_000 },
+    });
     expect(auditTestState.recorded).toBe(1);
+    expect(hasExecutionIdentityAdmissionSink()).toBe(true);
+    expect(
+      enqueueExecutionIdentityContextAtAdmission(
+        {
+          runId: "gateway-admission",
+          agentId: "main",
+          ingress: { kind: "system", boundary: "gateway.boot", state: "present" },
+          runtime: { kind: "embedded" },
+        },
+        { enabled: true, runtimeInstanceId: "runtime-1" },
+      )?.accepted,
+    ).toBe(true);
+    expect(auditTestState.identityRecorded).toBe(1);
     await unsubs.agentUnsub();
     expect(auditTestState.stopped).toBe(1);
+    expect(hasExecutionIdentityAdmissionSink()).toBe(false);
   });
 
   it("keeps retention maintenance but creates no producers when audit.enabled is false", async () => {
@@ -143,27 +211,48 @@ describe("startGatewayEventSubscriptions", () => {
     emitAgentAuditEvent({
       runId: "disabled-private",
       stream: "lifecycle",
-      data: { phase: "start" },
+      data: { phase: "start", startedAt: 1_000 },
     });
-    emitAgentEvent({ runId: "disabled-public", stream: "lifecycle", data: { phase: "start" } });
+    emitAgentEvent({
+      runId: "disabled-public",
+      stream: "lifecycle",
+      data: { phase: "start", startedAt: 1_000 },
+    });
     expect(auditTestState.recorded).toBe(0);
-    await vi.waitFor(() => expect(warn).toHaveBeenCalledOnce());
+    await waitForFast(() => expect(warn).toHaveBeenCalledOnce());
     warn.mockClear();
     // Disabled wiring must still unsubscribe cleanly.
     await unsubs.agentUnsub();
     expect(auditTestState.stopped).toBe(1);
   });
 
-  it("logs lazy agent event module failures", async () => {
+  it("logs lazy agent event handler failures", async () => {
     unsubs = startGatewayEventSubscriptions(createParams());
 
-    emitAgentEvent({ runId: "run-1", stream: "lifecycle", data: { phase: "start" } });
+    emitAgentEvent({
+      runId: "run-1",
+      stream: "lifecycle",
+      data: { phase: "start", startedAt: 1_000 },
+    });
 
-    await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(1));
+    await waitForFast(() => expect(warn).toHaveBeenCalledTimes(1));
     expect(warn).toHaveBeenCalledWith(
       "Agent event dispatch failed",
       expect.objectContaining({ runId: "run-1", stream: "lifecycle" }),
     );
+  });
+
+  it("disposes a loaded agent event handler on unsubscribe", async () => {
+    const dispose = vi.fn();
+    const handler = Object.assign(vi.fn(), { dispose });
+    agentEventHandlerMocks.create.mockReturnValue(handler);
+    unsubs = startGatewayEventSubscriptions(createParams());
+
+    emitAgentEvent({ runId: "run-dispose", stream: "lifecycle", data: { phase: "error" } });
+    await waitForFast(() => expect(handler).toHaveBeenCalledOnce());
+
+    await unsubs.agentUnsub();
+    expect(dispose).toHaveBeenCalledOnce();
   });
 
   it("logs transcript handler failures", async () => {
@@ -174,11 +263,63 @@ describe("startGatewayEventSubscriptions", () => {
       sessionKey: "agent:main:main",
     } as InternalSessionTranscriptUpdate);
 
-    await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(1));
+    await waitForFast(() => expect(warn).toHaveBeenCalledTimes(1));
     expect(warn).toHaveBeenCalledWith(
       "Transcript update dispatch failed",
       expect.objectContaining({ sessionKey: "agent:main:main" }),
     );
+  });
+
+  it("logs real asynchronous transcript failures and recovers the broadcast queue", async () => {
+    transcriptBroadcastMocks.useActualHandler = true;
+    const persistenceFailure = new Error("session transcript read failed");
+    transcriptBroadcastMocks.readMessageCount
+      .mockRejectedValueOnce(persistenceFailure)
+      .mockResolvedValueOnce(2);
+
+    const params = createParams();
+    params.sessionEventSubscribers.subscribe("conn-transcript");
+    unsubs = startGatewayEventSubscriptions(params);
+
+    const emitMessage = (messageId: string) =>
+      emitSessionTranscriptUpdate({
+        sessionFile: "/tmp/openclaw-transcript-dispatch.sqlite",
+        sessionKey: "agent:main:main",
+        message: { role: "assistant", content: [{ type: "text", text: "visible answer" }] },
+        messageId,
+        target: {
+          agentId: "main",
+          sessionId: "sess-transcript",
+          sessionKey: "agent:main:main",
+          storePath: "/tmp/openclaw-transcript-dispatch-sessions.json",
+        },
+      });
+
+    emitMessage("failed-message");
+    await waitForFast(() =>
+      expect(transcriptBroadcastMocks.readMessageCount).toHaveBeenCalledOnce(),
+    );
+    await waitForFast(() =>
+      expect(warn).toHaveBeenCalledWith("Transcript update dispatch failed", {
+        sessionKey: "agent:main:main",
+        error: persistenceFailure,
+      }),
+    );
+    expect(params.broadcastToConnIds).not.toHaveBeenCalled();
+
+    emitMessage("recovered-message");
+    await waitForFast(() => expect(params.broadcastToConnIds).toHaveBeenCalledOnce());
+    expect(params.broadcastToConnIds).toHaveBeenCalledWith(
+      "session.message",
+      expect.objectContaining({
+        sessionKey: "agent:main:main",
+        messageId: "recovered-message",
+        messageSeq: 2,
+      }),
+      new Set(["conn-transcript"]),
+    );
+    expect(transcriptBroadcastMocks.readMessageCount).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledOnce();
   });
 
   it("logs lifecycle handler failures", async () => {
@@ -186,7 +327,7 @@ describe("startGatewayEventSubscriptions", () => {
 
     emitSessionLifecycleEvent({ sessionKey: "agent:main:main", reason: "created" });
 
-    await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(1));
+    await waitForFast(() => expect(warn).toHaveBeenCalledTimes(1));
     expect(warn).toHaveBeenCalledWith(
       "Lifecycle event dispatch failed",
       expect.objectContaining({ sessionKey: "agent:main:main" }),
@@ -196,7 +337,7 @@ describe("startGatewayEventSubscriptions", () => {
   it("broadcasts bounded public task summaries with ledger statuses", async () => {
     const broadcast = vi.fn<SubscriptionParams["broadcast"]>();
     unsubs = startGatewayEventSubscriptions({ ...createParams(), broadcast });
-    await vi.waitFor(() => expect(getTaskRegistryObservers()).not.toBeNull());
+    await waitForFast(() => expect(getTaskRegistryObservers()).not.toBeNull());
 
     const completed = createTaskRecord({
       runtime: "subagent",
@@ -243,7 +384,7 @@ describe("startGatewayEventSubscriptions", () => {
     expect(wireTerminalSummary?.length ?? 0).toBeLessThan(10_000);
 
     void unsubs?.taskUnsub();
-    await vi.waitFor(() => expect(getTaskRegistryObservers()).toBeNull());
+    await waitForFast(() => expect(getTaskRegistryObservers()).toBeNull());
     broadcast.mockClear();
     createTaskRecord({
       runtime: "cli",
@@ -264,7 +405,7 @@ describe("startGatewayEventSubscriptions", () => {
       ...createParams(),
       broadcast: staleBroadcast,
     });
-    await vi.waitFor(() => expect(getTaskRegistryObservers()).not.toBeNull());
+    await waitForFast(() => expect(getTaskRegistryObservers()).not.toBeNull());
     const staleObservers = getTaskRegistryObservers();
 
     const replacementBroadcast = vi.fn<SubscriptionParams["broadcast"]>();
@@ -272,7 +413,7 @@ describe("startGatewayEventSubscriptions", () => {
       ...createParams(),
       broadcast: replacementBroadcast,
     });
-    await vi.waitFor(() => {
+    await waitForFast(() => {
       const current = getTaskRegistryObservers();
       expect(current).not.toBeNull();
       expect(current).not.toBe(staleObservers);

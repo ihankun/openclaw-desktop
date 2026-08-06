@@ -1,6 +1,7 @@
 // Telegram message/session/prompt pipeline shared by bot handler registrars.
 import type { Message } from "grammy/types";
 import { resolveChannelContextVisibilityMode } from "openclaw/plugin-sdk/context-visibility-runtime";
+import { kindFromMime } from "openclaw/plugin-sdk/media-runtime";
 import { evaluateSupplementalContextVisibility } from "openclaw/plugin-sdk/security-runtime";
 import { expandTelegramAllowFromWithAccessGroups } from "./access-groups.js";
 import { resolveTelegramAccount, resolveTelegramMediaRuntimeOptions } from "./accounts.js";
@@ -29,6 +30,7 @@ import { resolveTelegramForumThreadId } from "./bot/helpers.js";
 import type { TelegramContext } from "./bot/types.js";
 import { resolveTelegramScopedGroupConfig } from "./group-config-helpers.js";
 import type { TelegramCachedMessageNode, TelegramReplyChainEntry } from "./message-cache.js";
+import type { TelegramMessageDispatchReplayClaim } from "./message-dispatch-dedupe.js";
 import { resolveTelegramPromptMediaPath } from "./prompt-media-path.js";
 
 export function createTelegramHandlerMessageRuntime({
@@ -68,27 +70,25 @@ export function createTelegramHandlerMessageRuntime({
   const { resolveTelegramSessionState, resolvePromptContextAmbientWatermark } = sessionRuntime;
   const {
     recordMessageForReplyChain,
+    resolveCachedMessageThreadId,
     buildReplyChainForMessage,
     toReplyChainEntry,
     buildPromptContextForMessage,
-  } = createTelegramMessageContextRuntime(
-    {
-      cfg,
-      accountId,
-      opts,
-      telegramCfg,
-      telegramDeps,
-    },
-    sessionRuntime,
-  );
+  } = createTelegramMessageContextRuntime({
+    cfg,
+    accountId,
+    opts,
+    telegramCfg,
+    telegramDeps,
+  });
   const {
     normalizePromptContextMinTimestampMs,
     promptContextBoundaryOptions,
     latestPromptContextMinTimestampMs,
     latestPromptContextAmbientWatermark,
-    mergeDispatchDedupeKeys,
-    releaseDispatchDedupeKeys,
-    commitDispatchDedupeKeys,
+    mergeDispatchDedupeClaims,
+    releaseDispatchDedupeClaims,
+    commitDispatchDedupeClaims,
     buildFailedProcessingResult,
     settleSpooledReplayParticipants,
     beginSpooledReplaySettlementHolds,
@@ -129,6 +129,7 @@ export function createTelegramHandlerMessageRuntime({
           mediaRef = media
             ? {
                 path: media.path,
+                kind: media.kind,
                 ...(media.contentType ? { contentType: media.contentType } : {}),
                 ...(media.stickerMetadata ? { stickerMetadata: media.stickerMetadata } : {}),
               }
@@ -161,7 +162,7 @@ export function createTelegramHandlerMessageRuntime({
     promptContextMessageSelection?: TelegramPromptContextMessageSelection;
     storeAllowFrom: string[];
     options?: TelegramMessageContextOptions;
-    dispatchDedupeKeys?: string[];
+    dispatchDedupeClaims?: TelegramMessageDispatchReplayClaim[];
     spooledReplayParticipants?: readonly TelegramSpooledReplayDeferredParticipant[];
     spooledReplayAbortSignal?: AbortSignal;
   }): Promise<TelegramMessageProcessingResult> => {
@@ -226,7 +227,7 @@ export function createTelegramHandlerMessageRuntime({
             ingressSpooledReplayParticipants,
           );
           try {
-            await commitDispatchDedupeKeys(params.dispatchDedupeKeys ?? [], {
+            await commitDispatchDedupeClaims(params.dispatchDedupeClaims ?? [], {
               requirePersistent: true,
             });
           } catch (error) {
@@ -236,8 +237,8 @@ export function createTelegramHandlerMessageRuntime({
           releaseSettlementHolds("discard-pending");
           dispatchDedupeCommitted = true;
         } else {
-          releaseDispatchDedupeKeys(
-            params.dispatchDedupeKeys ?? [],
+          releaseDispatchDedupeClaims(
+            params.dispatchDedupeClaims ?? [],
             result.kind === "failed-retryable" ? result.error : undefined,
           );
         }
@@ -336,9 +337,16 @@ export function createTelegramHandlerMessageRuntime({
         const promptMediaPath = entry.mediaPath
           ? resolveTelegramPromptMediaPath(entry.mediaPath)
           : undefined;
+        // Stored kinds are typed non-unknown; MIME inference fills gaps and
+        // collapses an "unknown" inference to document for this deliverable-only surface.
+        const inferredKind = kindFromMime(entry.mediaType);
+        const mediaKind =
+          entry.mediaKind ??
+          (inferredKind && inferredKind !== "unknown" ? inferredKind : "document");
         if (entry.messageId && entry.mediaPath && promptMediaPath) {
           promptContextMediaByMessageId.set(entry.messageId, {
             path: promptMediaPath,
+            kind: mediaKind,
             ...(entry.mediaType ? { contentType: entry.mediaType } : {}),
           });
         }
@@ -361,7 +369,7 @@ export function createTelegramHandlerMessageRuntime({
           cfg: runtimeCfg,
           telegramCfg: runtimeTelegramCfg,
           onDispatchStart: async () => {
-            await commitDispatchDedupeKeys(params.dispatchDedupeKeys ?? []);
+            await commitDispatchDedupeClaims(params.dispatchDedupeClaims ?? []);
             dispatchDedupeCommitted = true;
           },
           spooledReplayAbortSignal: params.spooledReplayAbortSignal,
@@ -382,9 +390,9 @@ export function createTelegramHandlerMessageRuntime({
         return await finalizeSpooledReplayResult(result);
       }
       if (result.kind === "completed" && !dispatchDedupeCommitted) {
-        await commitDispatchDedupeKeys(params.dispatchDedupeKeys ?? []);
+        await commitDispatchDedupeClaims(params.dispatchDedupeClaims ?? []);
       } else if (result.kind !== "completed" && !dispatchDedupeCommitted) {
-        releaseDispatchDedupeKeys(params.dispatchDedupeKeys ?? []);
+        releaseDispatchDedupeClaims(params.dispatchDedupeClaims ?? []);
       }
       return result;
     } catch (err) {
@@ -392,7 +400,7 @@ export function createTelegramHandlerMessageRuntime({
         return await finalizeSpooledReplayResult(buildFailedProcessingResult(err));
       }
       if (!dispatchDedupeCommitted) {
-        releaseDispatchDedupeKeys(params.dispatchDedupeKeys ?? [], err);
+        releaseDispatchDedupeClaims(params.dispatchDedupeClaims ?? [], err);
       }
       throw err;
     }
@@ -404,8 +412,8 @@ export function createTelegramHandlerMessageRuntime({
     promptContextBoundaryOptions,
     latestPromptContextMinTimestampMs,
     latestPromptContextAmbientWatermark,
-    mergeDispatchDedupeKeys,
-    releaseDispatchDedupeKeys,
+    mergeDispatchDedupeClaims,
+    releaseDispatchDedupeClaims,
     buildFailedProcessingResult,
     settleSpooledReplayParticipants,
     createSpooledReplayParticipantForBufferedWork,
@@ -417,6 +425,7 @@ export function createTelegramHandlerMessageRuntime({
     resolveTelegramSessionState,
     resolvePromptContextAmbientWatermark,
     recordMessageForReplyChain,
+    resolveCachedMessageThreadId,
     processMessageWithReplyChain,
   };
 }

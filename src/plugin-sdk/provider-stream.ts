@@ -36,7 +36,6 @@ export {
   createMoonshotThinkingWrapper,
   createPlainTextToolCallCompatWrapper,
   createToolStreamWrapper,
-  createZaiToolStreamWrapper,
   defaultToolStreamExtraParams,
   isOpenAICompatibleThinkingEnabled,
   type ProviderStreamWrapperFactory,
@@ -113,7 +112,7 @@ export function buildProviderStreamFamilyHooks(
       return {
         wrapStreamFn: (ctx: ProviderWrapStreamFnContext) => {
           const thinkingLevel =
-            ctx.modelId === "kilo/auto" || isProxyReasoningUnsupported(ctx.modelId)
+            ctx.modelId === "kilo-auto/balanced" || isProxyReasoningUnsupported(ctx.modelId)
               ? undefined
               : ctx.thinkingLevel;
           return createKilocodeWrapper(ctx.streamFn, thinkingLevel);
@@ -220,7 +219,6 @@ export { createMinimaxFastModeWrapper } from "../llm/providers/stream-wrappers/m
 export {
   createOpenAIAttributionHeadersWrapper,
   createCodexNativeWebSearchWrapper,
-  createOpenAIDefaultTransportWrapper,
   createOpenAIFastModeWrapper,
   createOpenAIReasoningCompatibilityWrapper,
   createOpenAIResponsesContextManagementWrapper,

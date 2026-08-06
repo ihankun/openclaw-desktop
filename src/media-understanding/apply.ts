@@ -9,7 +9,6 @@ import {
 import pMap from "p-map";
 import type { ActiveMediaModel } from "../../packages/media-understanding-common/src/active-model.js";
 import {
-  extractMediaUserText,
   formatAudioTranscripts,
   formatMediaUnderstandingBody,
 } from "../../packages/media-understanding-common/src/format.js";
@@ -19,6 +18,7 @@ import type { OpenClawConfig } from "../config/types.js";
 import { logVerbose, shouldLogVerbose } from "../globals.js";
 import { renderFileContextBlock } from "../media/file-context.js";
 import { extractFileContentFromSource, normalizeMimeType } from "../media/input-files.js";
+import { classifyMediaReferenceSource } from "../media/media-reference.js";
 import { wrapExternalContent } from "../security/external-content.js";
 import { runMediaCapability } from "./apply-capability.js";
 import { resolveAttachmentKind } from "./attachments.js";
@@ -53,6 +53,7 @@ export type ApplyMediaUnderstandingResult = {
 };
 
 const CAPABILITY_ORDER: MediaUnderstandingCapability[] = ["image", "audio", "video"];
+const AUDIO_ONLY_CAPABILITY_ORDER: MediaUnderstandingCapability[] = ["audio"];
 const EMPTY_VOICE_NOTE_PLACEHOLDER =
   "[Voice note could not be transcribed because the audio attachment was too small]";
 const EXTRA_TEXT_MIMES = [
@@ -412,7 +413,12 @@ async function extractFileContext(params: {
     if (!forcedTextMime && (kind === "image" || kind === "video" || kind === "audio")) {
       continue;
     }
-    if (!limits.allowUrl && attachment.url && !attachment.path) {
+    if (
+      !limits.allowUrl &&
+      attachment.url &&
+      !attachment.path &&
+      !classifyMediaReferenceSource(attachment.url).isMediaStoreUrl
+    ) {
       if (shouldLogVerbose()) {
         logVerbose(`media: file attachment skipped (url disabled) index=${attachment.index}`);
       }
@@ -538,13 +544,14 @@ export async function applyMediaUnderstanding(params: {
   workspaceDir?: string;
   providers?: Record<string, MediaUnderstandingProvider>;
   activeModel?: ActiveMediaModel;
+  /** Preserve native-harness ownership of image, video, and file inputs while applying STT. */
+  processingMode?: "audio-only";
 }): Promise<ApplyMediaUnderstandingResult> {
   const { ctx, cfg } = params;
-  const mediaWorkspaceDir = ctx.MediaWorkspaceDir ?? params.workspaceDir;
   const commandCandidates = [ctx.CommandBody, ctx.RawBody, ctx.Body];
   const originalUserText =
     commandCandidates
-      .map((value) => extractMediaUserText(value))
+      .map((value) => normalizeOptionalString(value))
       .find((value) => value && value.trim()) ?? undefined;
 
   const attachments = normalizeMediaAttachments(ctx);
@@ -556,12 +563,12 @@ export async function applyMediaUnderstanding(params: {
       workspaceDir: params.workspaceDir,
     }),
     ssrfPolicy: cfg.tools?.web?.fetch?.ssrfPolicy,
-    workspaceDir: mediaWorkspaceDir,
+    workspaceDir: params.workspaceDir,
   });
 
   try {
     const results = await pMap(
-      CAPABILITY_ORDER,
+      params.processingMode === "audio-only" ? AUDIO_ONLY_CAPABILITY_ORDER : CAPABILITY_ORDER,
       async (capability) =>
         await runMediaCapability({
           capability,
@@ -686,13 +693,17 @@ export async function applyMediaUnderstanding(params: {
         )
         .map((output) => output.attachmentIndex),
     );
-    const fileContext = await extractFileContext({
-      attachments,
-      cache,
-      cfg,
-      limits: resolveFileExtractionLimits(cfg),
-      skipAttachmentIndexes: audioAttachmentIndexes.size > 0 ? audioAttachmentIndexes : undefined,
-    });
+    const fileContext =
+      params.processingMode === "audio-only"
+        ? { blocks: [], images: [] }
+        : await extractFileContext({
+            attachments,
+            cache,
+            cfg,
+            limits: resolveFileExtractionLimits(cfg),
+            skipAttachmentIndexes:
+              audioAttachmentIndexes.size > 0 ? audioAttachmentIndexes : undefined,
+          });
     if (fileContext.blocks.length > 0) {
       ctx.Body = appendFileBlocks(ctx.Body, fileContext.blocks);
     }

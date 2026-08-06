@@ -11,7 +11,7 @@ import type {
   AcpRuntimeTurnInput,
 } from "../../plugin-sdk/acp-runtime.js";
 import { clearPluginCommands } from "../../plugins/commands.js";
-import { setActivePluginRegistry } from "../../plugins/runtime.js";
+import { getActivePluginRegistry, setActivePluginRegistry } from "../../plugins/runtime.js";
 import {
   createChannelTestPluginBase,
   createTestRegistry,
@@ -71,9 +71,9 @@ export const automaticDirectReplyConfig = {
 
 export let dispatchReplyFromConfig: typeof import("./dispatch-from-config.js").dispatchReplyFromConfig;
 
-export let dispatchFromConfigTesting: typeof import("./dispatch-from-config.js").testing;
+export let dispatchFromConfigTesting: typeof import("./dispatch-from-config.test-support.js").testing;
 
-export let resetInboundDedupe: typeof import("./inbound-dedupe.js").resetInboundDedupe;
+let resetInboundDedupe: typeof import("./inbound-dedupe.js").resetInboundDedupe;
 
 export let tryDispatchAcpReplyHook: typeof import("../../plugin-sdk/acp-runtime.js").tryDispatchAcpReplyHook;
 
@@ -81,17 +81,17 @@ export let createReplyOperation: typeof import("./reply-run-registry.js").create
 
 export let replyRunRegistry: typeof import("./reply-run-registry.js").replyRunRegistry;
 
-export let replyRunTesting: typeof import("./reply-run-registry.js").testing;
+let replyRunTesting: typeof import("./reply-run-registry.test-support.js").testing;
 
 export let admitReplyTurn: typeof import("./reply-turn-admission.js").admitReplyTurn;
 
 export let runWithReplyOperationLifecycleAdmission: typeof import("./reply-turn-admission.js").runWithReplyOperationLifecycleAdmission;
 
-export type DispatchReplyArgs = Parameters<
+type DispatchReplyArgs = Parameters<
   typeof import("./dispatch-from-config.js").dispatchReplyFromConfig
 >[0];
 
-export function shouldUseAcpReplyDispatchHook(eventUnknown: unknown): boolean {
+function shouldUseAcpReplyDispatchHook(eventUnknown: unknown): boolean {
   const event = eventUnknown as {
     sessionKey?: string;
     ctx?: {
@@ -115,7 +115,7 @@ export function setNoAbort() {
   mocks.tryFastAbortFromMessage.mockResolvedValue(noAbortResult);
 }
 
-export type MockAcpRuntime = AcpRuntime & {
+type MockAcpRuntime = AcpRuntime & {
   ensureSession: Mock<(input: AcpRuntimeEnsureInput) => Promise<AcpRuntimeHandle>>;
   runTurn: Mock<(input: AcpRuntimeTurnInput) => AsyncIterable<AcpRuntimeEvent>>;
   cancel: Mock<(input: { handle: AcpRuntimeHandle; reason?: string }) => Promise<void>>;
@@ -148,7 +148,7 @@ export function createAcpRuntime(events: AcpRuntimeEvent[]): MockAcpRuntime {
   return runtime as MockAcpRuntime;
 }
 
-export function createMockAcpSessionManager() {
+function createMockAcpSessionManager() {
   return {
     resolveSession: (params: { cfg: OpenClawConfig; sessionKey: string }) => {
       const entry = acpMocks.readAcpSessionEntry({
@@ -310,6 +310,25 @@ export function installThreadingTestPlugin(params: { defaultAccountId?: string; 
   );
 }
 
+export function installCaptionedVoiceTestPlugin(id: string) {
+  const plugin = createChannelTestPluginBase({
+    id,
+    capabilities: {
+      chatTypes: ["direct"],
+      tts: { voice: { synthesisTarget: "voice-note", captionedFinalText: true } },
+    },
+  });
+  setActivePluginRegistry(
+    createTestRegistry([
+      {
+        pluginId: id,
+        source: "test",
+        plugin,
+      },
+    ]),
+  );
+}
+
 export function requireToolResultHandler(
   handler: GetReplyOptions["onToolResult"] | undefined,
 ): NonNullable<GetReplyOptions["onToolResult"]> {
@@ -349,19 +368,16 @@ export function messageAuditEvents(): Array<Record<string, unknown>> {
 }
 
 export const globalBeforeAll0 = async () => {
-  ({ dispatchReplyFromConfig, testing: dispatchFromConfigTesting } =
-    await import("./dispatch-from-config.js"));
+  ({ dispatchReplyFromConfig } = await import("./dispatch-from-config.js"));
+  ({ testing: dispatchFromConfigTesting } = await import("./dispatch-from-config.test-support.js"));
   await import("./dispatch-acp.js");
   await import("./dispatch-acp-command-bypass.js");
   await import("./dispatch-acp-tts.runtime.js");
   await import("./dispatch-acp-session.runtime.js");
   ({ resetInboundDedupe } = await import("./inbound-dedupe.js"));
   ({ tryDispatchAcpReplyHook } = await import("../../plugin-sdk/acp-runtime.js"));
-  ({
-    createReplyOperation,
-    replyRunRegistry,
-    testing: replyRunTesting,
-  } = await import("./reply-run-registry.js"));
+  ({ createReplyOperation, replyRunRegistry } = await import("./reply-run-registry.js"));
+  ({ testing: replyRunTesting } = await import("./reply-run-registry.test-support.js"));
   ({ admitReplyTurn, runWithReplyOperationLifecycleAdmission } =
     await import("./reply-turn-admission.js"));
 };
@@ -479,7 +495,9 @@ export const describe0BeforeEach0 = () => {
     ),
   );
   mocks.routeReply.mockReset();
-  mocks.routeReply.mockResolvedValue({ ok: true, messageId: "mock" });
+  mocks.routeReply.mockResolvedValue({ ok: true, delivered: true, messageId: "mock" });
+  mocks.tryFastApproveFromMessage.mockReset();
+  mocks.tryFastApproveFromMessage.mockResolvedValue({ handled: false });
   acpMocks.listAcpSessionEntries.mockReset().mockResolvedValue([]);
   diagnosticMocks.logMessageQueued.mockClear();
   diagnosticMocks.logMessageProcessed.mockClear();
@@ -563,7 +581,10 @@ export const describe0BeforeEach0 = () => {
   transcriptMocks.appendAssistantMessageToSessionTranscript.mockClear();
   stageSandboxMediaMocks.stageSandboxMedia.mockReset();
   stageSandboxMediaMocks.stageSandboxMedia.mockResolvedValue({ staged: new Map() });
-  runtimePluginMocks.ensureRuntimePluginsLoaded.mockClear();
+  runtimePluginMocks.loadAgentRuntimePluginRegistryHandle.mockReset();
+  runtimePluginMocks.loadAgentRuntimePluginRegistryHandle.mockImplementation(
+    () => getActivePluginRegistry() ?? runtimePluginMocks.pluginRegistry,
+  );
 };
 
 export const createHookCtx = (overrides: Partial<MsgContext> = {}) =>
@@ -580,7 +601,7 @@ export const createHookCtx = (overrides: Partial<MsgContext> = {}) =>
 export const describe1BeforeEach0 = () => {
   resetInboundDedupe();
   mocks.routeReply.mockReset();
-  mocks.routeReply.mockResolvedValue({ ok: true, messageId: "mock" });
+  mocks.routeReply.mockResolvedValue({ ok: true, delivered: true, messageId: "mock" });
   threadInfoMocks.parseSessionThreadInfo.mockReset();
   threadInfoMocks.parseSessionThreadInfo.mockImplementation(parseGenericThreadSessionInfo);
   ttsMocks.state.synthesizeFinalAudio = false;
@@ -597,6 +618,10 @@ export const describe1BeforeEach0 = () => {
 
 export const describe2BeforeEach0 = () => {
   resetInboundDedupe();
+  // Same routeReply reset as the sibling suite setups: queued once-values and
+  // persistent overrides must not leak between tests.
+  mocks.routeReply.mockReset();
+  mocks.routeReply.mockResolvedValue({ ok: true, delivered: true, messageId: "mock" });
   sessionStoreMocks.currentEntry = undefined;
   sessionBindingMocks.resolveByConversation.mockReset();
   sessionBindingMocks.resolveByConversation.mockReturnValue(null);

@@ -1,15 +1,12 @@
 // Embedded run registry tests cover active run handles, queueing, abort/drain,
 // abandonment tracking, diagnostics, and snapshots.
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { importFreshModule } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  testing as replyRunTesting,
   createReplyOperation,
   isReplyRunActiveForSessionId,
 } from "../../auto-reply/reply/reply-run-registry.js";
+import { testing as replyRunTesting } from "../../auto-reply/reply/reply-run-registry.test-support.js";
 import { setDiagnosticsEnabledForProcess } from "../../infra/diagnostic-events.js";
 import { resetDiagnosticRunActivityForTest } from "../../logging/diagnostic-run-activity.js";
 import { markDiagnosticToolStartedForTest } from "../../logging/diagnostic-run-activity.test-support.js";
@@ -22,7 +19,6 @@ import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-trans
 import { createTestUserTurnTranscriptTarget } from "../../sessions/user-turn-transcript.test-support.js";
 import { MAX_TIMER_TIMEOUT_MS } from "../../shared/number-coercion.js";
 import {
-  testing,
   abortAndDrainEmbeddedAgentRun,
   abortEmbeddedAgentRun,
   clearActiveEmbeddedRun,
@@ -41,10 +37,10 @@ import {
   resolveActiveEmbeddedRunHandleSessionIdBySessionFile,
   setActiveEmbeddedRun,
   updateActiveEmbeddedRunSnapshot,
-  updateActiveEmbeddedRunSessionFile,
   waitForActiveEmbeddedRuns,
   waitForEmbeddedAgentRunEnd,
 } from "./runs.js";
+import { testing } from "./runs.test-support.js";
 
 type RunHandle = Parameters<typeof setActiveEmbeddedRun>[1];
 
@@ -56,10 +52,8 @@ function createRunHandle(
     isStreaming?: boolean;
     isStopped?: () => boolean;
     runId?: string;
-    queueMessage?: (
-      text: string,
-      options?: Parameters<RunHandle["queueMessage"]>[1],
-    ) => Promise<void>;
+    queueMessage?: RunHandle["queueMessage"];
+    supportsQueueMessageImages?: boolean;
     supportsTranscriptCommitWait?: boolean;
   } = {},
 ): RunHandle {
@@ -75,6 +69,7 @@ function createRunHandle(
       ? { isAbortable: () => overrides.isAbortable !== false }
       : {}),
     isCompacting: () => overrides.isCompacting ?? false,
+    supportsQueueMessageImages: overrides.supportsQueueMessageImages,
     supportsTranscriptCommitWait: overrides.supportsTranscriptCommitWait,
     abort,
   };
@@ -397,30 +392,6 @@ describe("embedded-agent runner run registry", () => {
     expect(abort).not.toHaveBeenCalled();
   });
 
-  it("resolves active embedded runs by canonical session file", async () => {
-    // Session-file lookup canonicalizes symlinks so heartbeat/diagnostic callers
-    // can find the active handle from the file path they observe.
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-run-registry-"));
-    try {
-      const sessionFile = path.join(tempDir, "session.jsonl");
-      const symlinkFile = path.join(tempDir, "session-link.jsonl");
-      await fs.writeFile(sessionFile, '{"type":"session"}\n', "utf8");
-      await fs.symlink(sessionFile, symlinkFile);
-      const handle = createRunHandle();
-
-      setActiveEmbeddedRun("session-file-run", handle, "agent:main:visible", sessionFile);
-
-      expect(resolveActiveEmbeddedRunHandleSessionIdBySessionFile(symlinkFile)).toBe(
-        "session-file-run",
-      );
-
-      clearActiveEmbeddedRun("session-file-run", handle, "agent:main:visible", sessionFile);
-      expect(resolveActiveEmbeddedRunHandleSessionIdBySessionFile(symlinkFile)).toBeUndefined();
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
-  });
-
   it("records active run session files in diagnostic state for heartbeat recovery", () => {
     setDiagnosticsEnabledForProcess(true);
     const sessionFile = "/tmp/openclaw-run-registry-session.jsonl";
@@ -430,15 +401,6 @@ describe("embedded-agent runner run registry", () => {
 
     expect(getDiagnosticSessionState({ sessionId: "session-file-diagnostics" }).sessionFile).toBe(
       sessionFile,
-    );
-
-    updateActiveEmbeddedRunSessionFile(
-      "session-file-diagnostics",
-      "/tmp/openclaw-run-registry-rotated.jsonl",
-    );
-
-    expect(getDiagnosticSessionState({ sessionId: "session-file-diagnostics" }).sessionFile).toBe(
-      "/tmp/openclaw-run-registry-rotated.jsonl",
     );
   });
 
@@ -460,6 +422,40 @@ describe("embedded-agent runner run registry", () => {
     expect(queueMessage).toHaveBeenCalledWith("continue", {
       steeringMode: "all",
       sourceReplyDeliveryMode: "message_tool_only",
+    });
+  });
+
+  it("rejects images when the active run cannot preserve them", () => {
+    const queueMessage = vi.fn(async () => {});
+    setActiveEmbeddedRun("session-images", {
+      ...createRunHandle(),
+      queueMessage,
+    });
+
+    const outcome = queueEmbeddedAgentMessageWithOutcome("session-images", "inspect", {
+      images: [{ type: "image", data: "png", mimeType: "image/png" }],
+    });
+
+    expect(outcome).toEqual({
+      queued: false,
+      sessionId: "session-images",
+      reason: "image_input_unsupported",
+      gatewayHealth: "live",
+    });
+    expect(queueMessage).not.toHaveBeenCalled();
+
+    setActiveEmbeddedRun(
+      "session-images",
+      createRunHandle({ queueMessage, supportsQueueMessageImages: true }),
+    );
+
+    expect(
+      queueEmbeddedAgentMessageWithOutcome("session-images", "inspect", {
+        images: [{ type: "image", data: "png", mimeType: "image/png" }],
+      }).queued,
+    ).toBe(true);
+    expect(queueMessage).toHaveBeenCalledWith("inspect", {
+      images: [{ type: "image", data: "png", mimeType: "image/png" }],
     });
   });
 
@@ -752,6 +748,31 @@ describe("embedded-agent runner run registry", () => {
     );
   });
 
+  it("reports accepted steering without transcript confirmation as non-replayable", async () => {
+    setActiveEmbeddedRun("session-unconfirmed", {
+      ...createRunHandle(),
+      queueMessage: async () => ({
+        transcriptCommit: "unconfirmed",
+        errorMessage: "receipt unavailable",
+      }),
+    });
+
+    const outcome = await queueEmbeddedAgentMessageWithOutcomeAsync(
+      "session-unconfirmed",
+      "continue",
+    );
+
+    expect(outcome).toEqual({
+      queued: true,
+      sessionId: "session-unconfirmed",
+      target: "embedded_run",
+      gatewayHealth: "live",
+      transcriptCommit: "unconfirmed",
+      errorMessage: "receipt unavailable",
+      enqueuedAtMs: expect.any(Number),
+    });
+  });
+
   it("rejects transcript-commit waits for active handles without support", async () => {
     const queueMessage = vi.fn(async () => {});
     setActiveEmbeddedRun("session-no-transcript-wait", {
@@ -812,11 +833,15 @@ describe("embedded-agent runner run registry", () => {
     vi.useFakeTimers();
     try {
       const abortRun = vi.fn();
-      setActiveEmbeddedRun("session-stuck", createRunHandle({ abort: abortRun }), "agent:main");
+      setActiveEmbeddedRun(
+        "session-stuck",
+        createRunHandle({ abort: abortRun }),
+        "agent:main:main",
+      );
 
       const resultPromise = abortAndDrainEmbeddedAgentRun({
         sessionId: "session-stuck",
-        sessionKey: "agent:main",
+        sessionKey: "agent:main:main",
         settleMs: 100,
         forceClear: true,
         reason: "test_timeout",
@@ -827,7 +852,7 @@ describe("embedded-agent runner run registry", () => {
       expect(result).toEqual({ aborted: true, drained: false, forceCleared: true });
       expect(abortRun).toHaveBeenCalledTimes(1);
       expect(isEmbeddedAgentRunHandleActive("session-stuck")).toBe(false);
-      expect(resolveActiveEmbeddedRunHandleSessionId("agent:main")).toBeUndefined();
+      expect(resolveActiveEmbeddedRunHandleSessionId("agent:main:main")).toBeUndefined();
     } finally {
       await vi.runOnlyPendingTimersAsync();
       vi.useRealTimers();
@@ -850,6 +875,64 @@ describe("embedded-agent runner run registry", () => {
       await vi.runOnlyPendingTimersAsync();
       vi.useRealTimers();
     }
+  });
+
+  it("waits without a timer when no run-end timeout is requested", async () => {
+    vi.useFakeTimers();
+    try {
+      const handle = createRunHandle();
+      setActiveEmbeddedRun("session-unbounded", handle);
+      const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+      const waitPromise = waitForEmbeddedAgentRunEnd("session-unbounded", null);
+
+      expect(setTimeoutSpy).not.toHaveBeenCalled();
+      clearActiveEmbeddedRun("session-unbounded", handle);
+      await expect(waitPromise).resolves.toBe(true);
+    } finally {
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for a reply-backed run without an embedded handle", async () => {
+    const operation = createReplyOperation({
+      sessionKey: "agent:main:reply-wait",
+      sessionId: "session-reply-wait",
+      resetTriggered: false,
+    });
+
+    const waitPromise = waitForEmbeddedAgentRunEnd("session-reply-wait", null);
+    let settled = false;
+    void waitPromise.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    operation.complete();
+    await expect(waitPromise).resolves.toBe(true);
+  });
+
+  it("waits for a replacement run under the same session id", async () => {
+    const firstHandle = createRunHandle();
+    const replacementHandle = createRunHandle();
+    setActiveEmbeddedRun("session-replaced", firstHandle);
+
+    const waitPromise = waitForEmbeddedAgentRunEnd("session-replaced", null);
+    clearActiveEmbeddedRun("session-replaced", firstHandle);
+    setActiveEmbeddedRun("session-replaced", replacementHandle);
+    await Promise.resolve();
+
+    let settled = false;
+    void waitPromise.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    clearActiveEmbeddedRun("session-replaced", replacementHandle);
+    await expect(waitPromise).resolves.toBe(true);
   });
 
   it("waits for active runs to drain", async () => {
@@ -920,8 +1003,7 @@ describe("embedded-agent runner run registry", () => {
     );
     const handle = createRunHandle();
 
-    runsA.testing.resetActiveEmbeddedRuns();
-    runsB.testing.resetActiveEmbeddedRuns();
+    testing.resetActiveEmbeddedRuns();
 
     try {
       runsA.setActiveEmbeddedRun("session-shared", handle);
@@ -930,8 +1012,7 @@ describe("embedded-agent runner run registry", () => {
       runsB.clearActiveEmbeddedRun("session-shared", handle);
       expect(runsA.isEmbeddedAgentRunActive("session-shared")).toBe(false);
     } finally {
-      runsA.testing.resetActiveEmbeddedRuns();
-      runsB.testing.resetActiveEmbeddedRuns();
+      testing.resetActiveEmbeddedRuns();
     }
   });
 
@@ -950,6 +1031,19 @@ describe("embedded-agent runner run registry", () => {
 
     expect(isEmbeddedAgentRunHandleActive("session-a")).toBe(false);
     expect(resolveActiveEmbeddedRunHandleSessionId("agent:main:main")).toBeUndefined();
+  });
+
+  it("clears a relative compatibility file key after normalization", () => {
+    const handle = createRunHandle();
+    const sessionFile = "relative-session-token";
+
+    setActiveEmbeddedRun("session-relative", handle, "agent:main:relative", sessionFile);
+    expect(resolveActiveEmbeddedRunHandleSessionIdBySessionFile(sessionFile)).toBe(
+      "session-relative",
+    );
+
+    clearActiveEmbeddedRun("session-relative", handle, "agent:main:relative", sessionFile);
+    expect(resolveActiveEmbeddedRunHandleSessionIdBySessionFile(sessionFile)).toBeUndefined();
   });
 
   it("tracks timeout abandonment by session id, key, and file until a new run starts", () => {

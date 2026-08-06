@@ -9,6 +9,7 @@ import {
   normalizeOptionalLowercaseString,
 } from "@openclaw/normalization-core/string-coerce";
 import { isLikelyMutatingToolName } from "./tool-mutation-names.js";
+import { isAutomationsToolName } from "./tools/automations-tool-name.js";
 
 export { isLikelyMutatingToolName };
 
@@ -76,6 +77,7 @@ const MESSAGE_READ_ONLY_ACTIONS = new Set([
 
 const REPLAY_SAFE_TOOL_NAMES = new Set([
   "agents_list",
+  "conversations_list",
   "find",
   "get_goal",
   "glob",
@@ -83,7 +85,6 @@ const REPLAY_SAFE_TOOL_NAMES = new Set([
   "image",
   "ls",
   "memory_get",
-  "memory_search",
   "pdf",
   "read",
   "search",
@@ -100,6 +101,7 @@ const REPLAY_SAFE_TOOL_NAMES = new Set([
 
 const BROWSER_READ_ONLY_ACTIONS = new Set(["console", "profiles", "snapshot", "status", "tabs"]);
 const COMPUTER_REPLAY_SAFE_ACTIONS = new Set(["screenshot", "wait"]);
+const MOBILE_UI_REPLAY_SAFE_ACTIONS = new Set(["observe"]);
 const GATEWAY_REPLAY_SAFE_ACTIONS = new Set(["config.get", "config.schema.lookup"]);
 const NODES_REPLAY_SAFE_ACTIONS = new Set(["status", "describe", "pending"]);
 
@@ -342,6 +344,8 @@ export function isMutatingToolCall(toolName: string, args: unknown): boolean {
     case "apply_patch":
     case "sessions_spawn":
     case "sessions_send":
+    case "conversations_send":
+    case "conversations_turn":
     case "create_goal":
     case "update_goal":
       return true;
@@ -358,6 +362,8 @@ export function isMutatingToolCall(toolName: string, args: unknown): boolean {
       return action !== "group_list";
     case "computer":
       return action == null || !COMPUTER_REPLAY_SAFE_ACTIONS.has(action);
+    case "mobile_ui":
+      return action == null || !MOBILE_UI_REPLAY_SAFE_ACTIONS.has(action);
     case "subagents":
       return action === "cancel" || action === "kill" || action === "steer";
     case "session_status":
@@ -367,7 +373,7 @@ export function isMutatingToolCall(toolName: string, args: unknown): boolean {
     case "nodes":
       return action == null || !NODES_REPLAY_SAFE_ACTIONS.has(action);
     default: {
-      if (normalized === "cron" || normalized === "canvas") {
+      if (isAutomationsToolName(normalized) || normalized === "canvas") {
         return action == null || !READ_ONLY_ACTIONS.has(action);
       }
       if (normalized.endsWith("_actions")) {
@@ -407,6 +413,8 @@ export function isReplaySafeToolCall(toolName: string, args: unknown): boolean {
       return action != null && BROWSER_READ_ONLY_ACTIONS.has(action);
     case "computer":
       return action != null && COMPUTER_REPLAY_SAFE_ACTIONS.has(action);
+    case "mobile_ui":
+      return action != null && MOBILE_UI_REPLAY_SAFE_ACTIONS.has(action);
     case "skill_workshop":
       return action === "list" || action === "inspect";
     case "transcripts":
@@ -416,7 +424,7 @@ export function isReplaySafeToolCall(toolName: string, args: unknown): boolean {
     case "nodes":
       return action != null && NODES_REPLAY_SAFE_ACTIONS.has(action);
     default: {
-      if (normalized === "cron" || normalized === "canvas") {
+      if (isAutomationsToolName(normalized) || normalized === "canvas") {
         return action != null && READ_ONLY_ACTIONS.has(action);
       }
       return false;

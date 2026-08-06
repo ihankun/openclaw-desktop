@@ -7,6 +7,7 @@ import { fireAndForgetBoundedHook } from "../../../hooks/fire-and-forget.js";
 import {
   diagnosticErrorCategory,
   diagnosticErrorFailureKind,
+  diagnosticHttpStatusCode,
   diagnosticProviderRequestIdHash,
 } from "../../../infra/diagnostic-error-metadata.js";
 import {
@@ -24,9 +25,9 @@ import {
 import {
   createChildDiagnosticTraceContext,
   freezeDiagnosticTraceContext,
-  formatDiagnosticTraceparent,
   type DiagnosticTraceContext,
 } from "../../../infra/diagnostic-trace-context.js";
+import { formatPropagatedDiagnosticTraceparent } from "../../../infra/diagnostic-trace-propagation.js";
 import { emitDiagnosticsTimelineEvent } from "../../../infra/diagnostics-timeline.js";
 import { markDiagnosticRunProgress } from "../../../logging/diagnostic-run-activity.js";
 import { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
@@ -54,6 +55,7 @@ type ModelCallDiagnosticContext = {
   contentCapture?: DiagnosticModelContentCapturePolicy;
   nextCallId: () => string;
   onStarted?: () => void;
+  suppressPluginHooks?: boolean;
 };
 
 type ModelCallEventBase = Omit<
@@ -87,6 +89,7 @@ type ModelCallUsage = NonNullable<
 >;
 type ModelCallObservationState = {
   requestPayloadBytes?: number;
+  responseStatus?: number;
   responseStreamBytes: number;
   timeToFirstByteMs?: number;
   modelContent?: DiagnosticModelCallContent;
@@ -95,6 +98,7 @@ type ModelCallObservationState = {
   contentCapture?: DiagnosticModelContentCapturePolicy;
   lastStreamProgressAt?: number;
   terminalEventEmitted?: boolean;
+  suppressPluginHooks?: boolean;
 };
 
 const MODEL_CALL_STREAM_PROGRESS_INTERVAL_MS = 30_000;
@@ -392,6 +396,7 @@ function baseModelCallEvent(
     model: ctx.model,
     ...(ctx.api && { api: ctx.api }),
     ...(ctx.transport && { transport: ctx.transport }),
+    observationUnit: "request",
     ...(ctx.contextTokenBudget ? { contextTokenBudget: ctx.contextTokenBudget } : {}),
     ...(ctx.contextWindowSource ? { contextWindowSource: ctx.contextWindowSource } : {}),
     ...(ctx.contextWindowReferenceTokens
@@ -429,6 +434,7 @@ function emitProviderRequestTimelineEvent(
   startedAt: number,
   durationMs: number,
   ok: boolean,
+  responseStatus: number | undefined,
 ): void {
   const provider = boundedTimelineAttribute(eventBase.provider);
   const model = boundedTimelineAttribute(eventBase.model);
@@ -444,6 +450,7 @@ function emitProviderRequestTimelineEvent(
     provider,
     operation: api ?? transport ?? "model.call",
     ok,
+    ...(responseStatus !== undefined ? { status: responseStatus } : {}),
     attributes: {
       ...(model ? { model } : {}),
       ...(api ? { api } : {}),
@@ -550,6 +557,7 @@ function dispatchModelCallEndedHook(
 function emitModelCallStarted(
   eventBase: ModelCallEventBase,
   modelContent: DiagnosticModelCallContent | undefined,
+  suppressPluginHooks: boolean,
 ): void {
   emitTrustedDiagnosticEventWithPrivateData(
     {
@@ -558,7 +566,9 @@ function emitModelCallStarted(
     },
     modelContentPrivateData(modelContent),
   );
-  dispatchModelCallStartedHook(eventBase);
+  if (!suppressPluginHooks) {
+    dispatchModelCallStartedHook(eventBase);
+  }
 }
 
 function emitModelCallCompleted(
@@ -572,7 +582,7 @@ function emitModelCallCompleted(
   state.terminalEventEmitted = true;
   const durationMs = Date.now() - startedAt;
   const sizeTimingFields = modelCallSizeTimingFields(state);
-  emitProviderRequestTimelineEvent(eventBase, startedAt, durationMs, true);
+  emitProviderRequestTimelineEvent(eventBase, startedAt, durationMs, true, state.responseStatus);
   emitTrustedDiagnosticEventWithPrivateData(
     {
       type: "model.call.completed",
@@ -583,18 +593,20 @@ function emitModelCallCompleted(
     },
     modelContentPrivateData(modelCallCompletedContent(state)),
   );
-  dispatchModelCallEndedHook(eventBase, {
-    durationMs,
-    outcome: "completed",
-    ...sizeTimingFields,
-  });
+  if (!state.suppressPluginHooks) {
+    dispatchModelCallEndedHook(eventBase, {
+      durationMs,
+      outcome: "completed",
+      ...sizeTimingFields,
+    });
+  }
 }
 
 function emitModelCallError(
   eventBase: ModelCallEventBase,
   startedAt: number,
   state: ModelCallObservationState,
-  fields: ModelCallErrorFields,
+  err: unknown,
 ): void {
   if (state.terminalEventEmitted) {
     return;
@@ -602,7 +614,11 @@ function emitModelCallError(
   state.terminalEventEmitted = true;
   const durationMs = Date.now() - startedAt;
   const sizeTimingFields = modelCallSizeTimingFields(state);
-  emitProviderRequestTimelineEvent(eventBase, startedAt, durationMs, false);
+  const fields = modelCallErrorFields(err);
+  const errorStatus = diagnosticHttpStatusCode(err);
+  const responseStatus =
+    state.responseStatus ?? (errorStatus === undefined ? undefined : Number(errorStatus));
+  emitProviderRequestTimelineEvent(eventBase, startedAt, durationMs, false, responseStatus);
   emitTrustedDiagnosticEventWithPrivateData(
     {
       type: "model.call.error",
@@ -614,12 +630,14 @@ function emitModelCallError(
     },
     modelContentPrivateData(modelCallCompletedContent(state)),
   );
-  dispatchModelCallEndedHook(eventBase, {
-    durationMs,
-    outcome: "error",
-    ...sizeTimingFields,
-    ...fields,
-  });
+  if (!state.suppressPluginHooks) {
+    dispatchModelCallEndedHook(eventBase, {
+      durationMs,
+      outcome: "error",
+      ...sizeTimingFields,
+      ...fields,
+    });
+  }
 }
 
 function withDiagnosticRequestContext(
@@ -628,8 +646,9 @@ function withDiagnosticRequestContext(
   state: ModelCallObservationState,
   callId: string,
 ): ModelCallStreamOptions {
-  const traceparent = formatDiagnosticTraceparent(trace);
+  const traceparent = formatPropagatedDiagnosticTraceparent(trace);
   const originalOnPayload = options?.onPayload;
+  const originalOnResponse = options?.onResponse;
   const onPayload: NonNullable<ModelCallStreamOptions>["onPayload"] = (payload, model) => {
     if (!originalOnPayload) {
       assignRequestPayloadBytes(state, payload);
@@ -645,14 +664,12 @@ function withDiagnosticRequestContext(
     assignRequestPayloadBytes(state, result ?? payload);
     return result;
   };
-
-  if (!traceparent) {
-    return {
-      ...options,
-      requestId: callId,
-      onPayload,
-    };
-  }
+  const onResponse: NonNullable<ModelCallStreamOptions>["onResponse"] = (response, model) => {
+    // Retrying providers can expose several responses; the terminal request status
+    // is the latest response observed before the model call completes or fails.
+    state.responseStatus = response.status;
+    return originalOnResponse?.(response, model);
+  };
 
   const headers: Record<string, string> = {};
   for (const [key, value] of Object.entries(options?.headers ?? {})) {
@@ -661,12 +678,15 @@ function withDiagnosticRequestContext(
     }
     headers[key] = value;
   }
-  headers[TRACEPARENT_HEADER_NAME] = traceparent;
+  if (traceparent) {
+    headers[TRACEPARENT_HEADER_NAME] = traceparent;
+  }
   return {
     ...options,
     requestId: callId,
-    headers,
+    ...((options?.headers || traceparent) && { headers }),
     onPayload,
+    onResponse,
   };
 }
 
@@ -728,7 +748,7 @@ async function* observeModelCallIterator<T>(
     emitModelCallCompleted(eventBase, startedAt, state);
   } catch (err) {
     iteratorSettled = true;
-    emitModelCallError(eventBase, startedAt, state, modelCallErrorFields(err));
+    emitModelCallError(eventBase, startedAt, state, err);
     throw err;
   } finally {
     if (!iteratorSettled) {
@@ -771,14 +791,14 @@ function createObservedResultFunction(
         return result.then(
           (resolved) => observeModelCallFinalResult(resolved, eventBase, startedAt, state),
           (err: unknown) => {
-            emitModelCallError(eventBase, startedAt, state, modelCallErrorFields(err));
+            emitModelCallError(eventBase, startedAt, state, err);
             throw err;
           },
         );
       }
       return observeModelCallFinalResult(result, eventBase, startedAt, state);
     } catch (err) {
-      emitModelCallError(eventBase, startedAt, state, modelCallErrorFields(err));
+      emitModelCallError(eventBase, startedAt, state, err);
       throw err;
     }
   };
@@ -862,13 +882,14 @@ export function wrapStreamFnWithDiagnosticModelCallEvents(
       : undefined;
     const eventBase = baseModelCallEvent(ctx, callId, trace, promptStats);
     const modelContent = streamContextModelContentFields(ctx.contentCapture, streamContext);
-    emitModelCallStarted(eventBase, modelContent);
+    emitModelCallStarted(eventBase, modelContent, ctx.suppressPluginHooks === true);
     ctx.onStarted?.();
     const startedAt = Date.now();
     const state: ModelCallObservationState = {
       responseStreamBytes: 0,
       modelContent,
       contentCapture: ctx.contentCapture,
+      suppressPluginHooks: ctx.suppressPluginHooks,
     };
     // Provider wrappers consume this same call id for transport correlation,
     // keeping external request evidence joined to the emitted diagnostics.
@@ -880,14 +901,14 @@ export function wrapStreamFnWithDiagnosticModelCallEvents(
         return result.then(
           (resolved) => observeModelCallResult(resolved, eventBase, startedAt, state),
           (err: unknown) => {
-            emitModelCallError(eventBase, startedAt, state, modelCallErrorFields(err));
+            emitModelCallError(eventBase, startedAt, state, err);
             throw err;
           },
         );
       }
       return observeModelCallResult(result, eventBase, startedAt, state);
     } catch (err) {
-      emitModelCallError(eventBase, startedAt, state, modelCallErrorFields(err));
+      emitModelCallError(eventBase, startedAt, state, err);
       throw err;
     }
   }) as StreamFn;

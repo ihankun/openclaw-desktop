@@ -12,6 +12,10 @@ import {
 } from "./subagent-registry-queries.js";
 import { getSubagentRunsSnapshotForRead } from "./subagent-registry-state.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
+import {
+  createSubagentRunRecord,
+  type SubagentRunRecordOverrides,
+} from "./subagent-test-fixtures.test-helpers.js";
 export {
   getSubagentSessionRuntimeMs,
   getSubagentSessionStartedAt,
@@ -22,12 +26,15 @@ type RegistryTestApi = {
   addSubagentRunForTests(entry: SubagentRunRecord): void;
   finalizeInterruptedSubagentRun(params: {
     runId: string;
+    expectedEntry?: SubagentRunRecord;
     error: string;
     endedAt?: number;
+    suppressSessionEffects?: boolean;
   }): Promise<number>;
   releaseSubagentRun(runId: string): void;
   resetSubagentRegistryForTests(opts?: { persist?: boolean }): void;
   testing: {
+    failQueuedSubagentRun(runId: string, error: string): boolean;
     sweepOnceForTests(): Promise<void>;
     runSweeperTickForTests(): Promise<void>;
     setDepsForTest(overrides?: Partial<RegistryDeps>): void;
@@ -36,6 +43,9 @@ type RegistryTestApi = {
 
 type RegistryDeps = {
   callGateway: typeof import("../gateway/call.js").callGateway;
+  getGatewayRecoveryRuntime: () =>
+    | import("../gateway/server-instance-runtime.types.js").GatewayRecoveryRuntime
+    | undefined;
   captureSubagentCompletionReply: typeof import("./subagent-announce.js").captureSubagentCompletionReply;
   cleanupBrowserSessionsForLifecycleEnd: typeof import("../browser-lifecycle-cleanup.js").cleanupBrowserSessionsForLifecycleEnd;
   getSubagentRunsSnapshotForRead: typeof import("./subagent-registry-state.js").getSubagentRunsSnapshotForRead;
@@ -46,8 +56,9 @@ type RegistryDeps = {
   resolveAgentTimeoutMs: typeof import("./timeout.js").resolveAgentTimeoutMs;
   restoreSubagentRunsFromDisk: typeof import("./subagent-registry-state.js").restoreSubagentRunsFromDisk;
   runSubagentAnnounceFlow: typeof import("./subagent-announce.js").runSubagentAnnounceFlow;
+  maybeWakeRequesterAfterAllChildrenSettled: typeof import("./subagent-announce.requester-settle-wake.js").maybeWakeRequesterAfterAllChildrenSettled;
   ensureContextEnginesInitialized?: () => void;
-  ensureRuntimePluginsLoaded?: typeof import("./runtime-plugins.js").ensureRuntimePluginsLoaded;
+  loadAgentRuntimePluginRegistryHandle?: import("./subagent-registry-deps.js").SubagentRegistryDeps["loadAgentRuntimePluginRegistryHandle"];
   resolveContextEngine?: typeof import("../context-engine/registry.js").resolveContextEngine;
 };
 
@@ -61,8 +72,14 @@ export function resetSubagentRegistryForTests(opts?: { persist?: boolean }) {
   getRegistryTestApi().resetSubagentRegistryForTests(opts);
 }
 
-export function addSubagentRunForTests(entry: SubagentRunRecord) {
-  getRegistryTestApi().addSubagentRunForTests(entry);
+export function addSubagentRunForTests(entry: SubagentRunRecordOverrides) {
+  const canonical = createSubagentRunRecord(entry);
+  const target = entry as Record<string, unknown>;
+  for (const key of Object.keys(target)) {
+    delete target[key];
+  }
+  Object.assign(target, canonical);
+  getRegistryTestApi().addSubagentRunForTests(entry as SubagentRunRecord);
 }
 
 export function releaseSubagentRun(runId: string) {
@@ -71,6 +88,7 @@ export function releaseSubagentRun(runId: string) {
 
 export async function finalizeInterruptedSubagentRun(params: {
   runId: string;
+  expectedEntry?: SubagentRunRecord;
   error: string;
   endedAt?: number;
 }) {
@@ -78,6 +96,8 @@ export async function finalizeInterruptedSubagentRun(params: {
 }
 
 export const testing = {
+  failQueuedSubagentRun: (runId: string, error: string) =>
+    getRegistryTestApi().testing.failQueuedSubagentRun(runId, error),
   sweepOnceForTests: () => getRegistryTestApi().testing.sweepOnceForTests(),
   runSweeperTickForTests: () => getRegistryTestApi().testing.runSweeperTickForTests(),
   setDepsForTest: (overrides?: Partial<RegistryDeps>) =>

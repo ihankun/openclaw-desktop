@@ -1,17 +1,22 @@
 // Telegram plugin module implements interactive fallback behavior.
 import {
   adaptMessagePresentationForChannel,
-  interactiveReplyToPresentation,
+  legacyInteractiveReplyToPresentation,
   isMessagePresentationInteractiveBlock,
   normalizeMessagePresentation,
-  normalizeInteractiveReply,
+  normalizeLegacyInteractiveReply,
   renderMessagePresentationFallbackText,
-  resolveInteractiveTextFallback,
+  resolveLegacyInteractiveTextFallback,
   type MessagePresentation,
   type MessagePresentationInteractiveBlock,
 } from "openclaw/plugin-sdk/interactive-runtime";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
-import { buildTelegramPresentationButtons, resolveTelegramInlineButtons } from "./button-types.js";
+import {
+  buildTelegramPresentationButtons,
+  resolveTelegramInlineButtons,
+  resolveTelegramQuestionOptionIndices,
+  type TelegramButtonBuildOptions,
+} from "./button-types.js";
 import { buildInlineKeyboard } from "./inline-keyboard.js";
 
 const TELEGRAM_CONTROL_ONLY_FALLBACK = "Choose an option.";
@@ -40,13 +45,17 @@ export const TELEGRAM_PRESENTATION_CAPABILITIES = {
   },
 };
 
-function canEncodeTelegramPresentationControl(block: MessagePresentationInteractiveBlock): boolean {
-  return Boolean(buildTelegramPresentationButtons({ blocks: [block] })?.length);
+function canEncodeTelegramPresentationControl(
+  block: MessagePresentationInteractiveBlock,
+  options?: TelegramButtonBuildOptions,
+): boolean {
+  return Boolean(buildTelegramPresentationButtons({ blocks: [block] }, options)?.length);
 }
 
 function partitionTelegramPresentationBlocks(params: {
   presentation: MessagePresentation;
   presentationControlsSelected: boolean;
+  buttonOptions: TelegramButtonBuildOptions;
 }): {
   fallbackBlocks: MessagePresentation["blocks"];
   nativeControlBlocks: MessagePresentationInteractiveBlock[];
@@ -66,7 +75,10 @@ function partitionTelegramPresentationBlocks(params: {
       const nativeButtons: typeof block.buttons = [];
       const fallbackButtons: typeof block.buttons = [];
       for (const button of block.buttons) {
-        const target = canEncodeTelegramPresentationControl({ type: "buttons", buttons: [button] })
+        const target = canEncodeTelegramPresentationControl(
+          { type: "buttons", buttons: [button] },
+          params.buttonOptions,
+        )
           ? nativeButtons
           : fallbackButtons;
         target.push(button);
@@ -83,7 +95,10 @@ function partitionTelegramPresentationBlocks(params: {
     const nativeOptions: typeof block.options = [];
     const fallbackOptions: typeof block.options = [];
     for (const option of block.options) {
-      const target = canEncodeTelegramPresentationControl({ type: "select", options: [option] })
+      const target = canEncodeTelegramPresentationControl(
+        { type: "select", options: [option] },
+        params.buttonOptions,
+      )
         ? nativeOptions
         : fallbackOptions;
       target.push(option);
@@ -102,7 +117,10 @@ function partitionTelegramPresentationBlocks(params: {
 }
 
 /** Convert portable presentation into the one Telegram payload shape used by every send funnel. */
-export function canonicalizeTelegramPresentationPayload(payload: ReplyPayload): ReplyPayload {
+export function canonicalizeTelegramPresentationPayload(
+  payload: ReplyPayload,
+  options?: { allowWebAppButtons?: boolean },
+): ReplyPayload {
   const normalizedPresentation = normalizeMessagePresentation(payload.presentation);
   const telegramData = payload.channelData?.telegram as
     | (Record<string, unknown> & {
@@ -122,26 +140,37 @@ export function canonicalizeTelegramPresentationPayload(payload: ReplyPayload): 
     capabilities: TELEGRAM_PRESENTATION_CAPABILITIES,
   });
 
-  const interactive = normalizeInteractiveReply(payload.interactive);
-  const existingButtons = resolveTelegramInlineButtons({
-    buttons: telegramData?.buttons,
-    interactive,
-  });
+  const interactive = normalizeLegacyInteractiveReply(payload.interactive);
+  const buttonOptions: TelegramButtonBuildOptions = {
+    allowWebAppButtons: options?.allowWebAppButtons === true,
+    questionOptionIndices: resolveTelegramQuestionOptionIndices(payload),
+  };
+  const existingButtons = resolveTelegramInlineButtons(
+    {
+      buttons: telegramData?.buttons,
+      interactive,
+    },
+    buttonOptions,
+  );
   const presentationControlsSelected = existingButtons === undefined;
   const { fallbackBlocks, nativeControlBlocks } = partitionTelegramPresentationBlocks({
     presentation,
     presentationControlsSelected,
+    buttonOptions,
   });
-  const presentationButtons = buildTelegramPresentationButtons({
-    blocks: nativeControlBlocks,
-  });
+  const presentationButtons = buildTelegramPresentationButtons(
+    {
+      blocks: nativeControlBlocks,
+    },
+    buttonOptions,
+  );
   const buttons = existingButtons ?? presentationButtons;
 
   const fallbackText = renderMessagePresentationFallbackText({
     presentation: { ...presentation, blocks: fallbackBlocks },
   });
   const currentText =
-    resolveInteractiveTextFallback({ text: payload.text, interactive })?.trim() ?? "";
+    resolveLegacyInteractiveTextFallback({ text: payload.text, interactive })?.trim() ?? "";
   const hasFallback =
     fallbackText.length > 0 &&
     (currentText === fallbackText || currentText.endsWith(`\n\n${fallbackText}`));
@@ -168,8 +197,8 @@ export function resolveTelegramInteractiveTextFallback(params: {
   interactive?: unknown;
   presentation?: unknown;
 }): string | undefined {
-  const interactive = normalizeInteractiveReply(params.interactive);
-  const text = resolveInteractiveTextFallback({
+  const interactive = normalizeLegacyInteractiveReply(params.interactive);
+  const text = resolveLegacyInteractiveTextFallback({
     text: params.text ?? undefined,
     interactive,
   });
@@ -189,7 +218,7 @@ export function resolveTelegramInteractiveTextFallback(params: {
   if (!interactive) {
     return text;
   }
-  const interactivePresentation = interactiveReplyToPresentation(interactive);
+  const interactivePresentation = legacyInteractiveReplyToPresentation(interactive);
   if (!interactivePresentation) {
     return text;
   }

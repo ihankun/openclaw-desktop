@@ -40,6 +40,15 @@ function buildTelegramThinkingProgressLine(progressTokens: number): ChannelProgr
   };
 }
 
+function buildTelegramTextToolProgressLine(text: string): ChannelProgressDraftLine {
+  return {
+    kind: "item",
+    label: "",
+    text,
+    prefix: false,
+  };
+}
+
 export function createTelegramProgressController(params: {
   accountId: string;
   chatId: TelegramMessageContext["chatId"];
@@ -65,11 +74,18 @@ export function createTelegramProgressController(params: {
     mode: params.streamMode,
     active: Boolean(answerLane.stream),
     seed: `${params.accountId}:${params.chatId}:${params.threadId ?? ""}`,
-    formatLine: (text) => (compositor.hasStatusHeadline ? text : formatTelegramProgressLine(text)),
+    formatLine: (text) =>
+      compositor.hasStatusHeadline || compositor.hasPlanProgress
+        ? text
+        : formatTelegramProgressLine(text),
     reasoningGate: params.streamReasoningInProgressDraft,
     reasoningLinePrefix: "🧠 ",
     commentaryLinePrefix: "💬 ",
     commentaryItalics: false,
+    updateOnLineChange: true,
+    // renderTelegramProgressDraftPreview draws the work lines from `lines` in
+    // headline/checklist mode, so they must not also arrive inside the text.
+    rendersRollingLinesNatively: true,
     update: async (streamText, options) => {
       draftEverRendered = true;
       await params.draft.prepareAnswerLaneForToolProgress();
@@ -81,7 +97,7 @@ export function createTelegramProgressController(params: {
           streamText,
           options?.lines ?? [],
           params.telegramCfg.richMessages === true,
-          compositor.hasStatusHeadline,
+          compositor.hasStatusHeadline || compositor.hasPlanProgress,
         ),
       );
       if (options?.flush) {
@@ -110,7 +126,10 @@ export function createTelegramProgressController(params: {
     if (!canPushToolProgress()) {
       return false;
     }
-    return await compositor.pushToolProgress(line, options);
+    return await compositor.pushToolProgress(
+      typeof line === "string" ? buildTelegramTextToolProgressLine(line) : line,
+      options,
+    );
   };
   const pushReasoningProgress = async (payload: {
     text?: string;
@@ -189,7 +208,7 @@ export function createTelegramProgressController(params: {
     if (payload.phase === "start") {
       const windowRendersTool =
         canPushToolProgress() &&
-        resolveChannelStreamingPreviewToolProgress(params.telegramCfg) &&
+        resolveChannelStreamingPreviewToolProgress(params.telegramCfg, true, params.streamMode) &&
         isChannelProgressDraftWorkToolName(toolName);
       if (windowRendersTool) {
         summary.noteToolCall();
@@ -253,16 +272,10 @@ export function createTelegramProgressController(params: {
     );
   };
   const handlePlanUpdate = async (payload: CallbackPayload<"onPlanUpdate">) => {
-    if (payload.phase === "update") {
-      await pushToolProgress(
-        buildChannelProgressDraftLine({
-          event: "plan",
-          phase: payload.phase,
-          title: payload.title,
-          explanation: payload.explanation,
-          steps: payload.steps,
-        }),
-      );
+    if (payload.phase === "update" && canPushToolProgress()) {
+      await compositor.pushPlanProgress(payload.steps, {
+        explanation: payload.explanation,
+      });
     }
   };
   const handleApprovalEvent = async (payload: CallbackPayload<"onApprovalEvent">) => {
@@ -316,6 +329,12 @@ export function createTelegramProgressController(params: {
 
   return {
     applyCollapseSummary,
+    beginQueuedFollowup: () => {
+      finalAnswerDeliveryStarted = false;
+      finalAnswerDelivered = false;
+      sawProgressFinal = false;
+      compositor.beginNewTurn({ force: true });
+    },
     canPushToolProgress,
     cancel: () => compositor.cancel(),
     closeReasoningBurst: () => summary.closeReasoningBurst(),

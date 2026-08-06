@@ -23,7 +23,7 @@ vi.mock("../session-utils.js", async () => {
   };
 });
 
-import { sessionsHandlers } from "./sessions.js";
+import { sessionDispatchHandlers } from "./sessions-dispatch.js";
 
 const sessionKey = "agent:main:cloud-test";
 const sessionId = "session-cloud-test";
@@ -91,11 +91,27 @@ function makeContext(overrides: Partial<GatewayRequestContext> = {}): GatewayReq
 async function invoke(context: GatewayRequestContext) {
   const respond = vi.fn() as unknown as RespondFn;
   await expectDefined(
-    sessionsHandlers["sessions.dispatch"],
-    'sessionsHandlers["sessions.dispatch"] test invariant',
+    sessionDispatchHandlers["sessions.dispatch"],
+    'sessionDispatchHandlers["sessions.dispatch"] test invariant',
   )({
     req: { id: "dispatch-request" } as never,
     params: { key: sessionKey, profileId: "test" },
+    respond,
+    context,
+    client: null,
+    isWebchatConnect: () => false,
+  });
+  return respond;
+}
+
+async function invokeReclaim(context: GatewayRequestContext) {
+  const respond = vi.fn() as unknown as RespondFn;
+  await expectDefined(
+    sessionDispatchHandlers["sessions.reclaim"],
+    'sessionDispatchHandlers["sessions.reclaim"] test invariant',
+  )({
+    req: { id: "reclaim-request" } as never,
+    params: { key: sessionKey },
     respond,
     context,
     client: null,
@@ -398,6 +414,97 @@ describe("sessions.dispatch", () => {
         }),
       }),
       undefined,
+    );
+  });
+});
+
+describe("sessions.reclaim", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.resolveTarget.mockReturnValue(
+      targetWithEntry({
+        sessionId,
+        worktree: { id: "worktree-1", branch: "openclaw/cloud-test", repoRoot: "/repo" },
+      }),
+    );
+    mocks.findLiveByOwner.mockReturnValue({
+      id: "worktree-1",
+      ownerKind: "session",
+      ownerId: sessionKey,
+    });
+  });
+
+  it("reconciles and reclaims an active placement", async () => {
+    const reclaim = vi.fn().mockResolvedValue(reclaimedPlacementRecord());
+    const respond = await invokeReclaim(
+      makeContext({
+        workerPlacementDispatchService: { dispatch: vi.fn(), reclaim },
+        workerSessionPlacementService: {
+          getMany: () =>
+            new Map([
+              [
+                sessionId,
+                {
+                  ...reclaimedPlacementRecord(),
+                  state: "active",
+                  generation: 3,
+                  recoveryError: null,
+                } as WorkerSessionPlacementRecord,
+              ],
+            ]),
+        },
+      }),
+    );
+
+    expect(reclaim).toHaveBeenCalledWith({ sessionId, sessionKey, agentId: "main" });
+    expect(respond).toHaveBeenCalledWith(
+      true,
+      expect.objectContaining({
+        ok: true,
+        placement: expect.objectContaining({ state: "reclaimed" }),
+      }),
+      undefined,
+    );
+  });
+
+  it("returns an already reclaimed placement as idempotent success", async () => {
+    const reclaim = vi.fn();
+    const respond = await invokeReclaim(
+      makeContext({
+        workerPlacementDispatchService: { dispatch: vi.fn(), reclaim },
+        workerSessionPlacementService: {
+          getMany: () => new Map([[sessionId, reclaimedPlacementRecord()]]),
+        },
+      }),
+    );
+
+    expect(reclaim).not.toHaveBeenCalled();
+    expect(respond).toHaveBeenCalledWith(
+      true,
+      expect.objectContaining({
+        ok: true,
+        placement: expect.objectContaining({ state: "reclaimed" }),
+      }),
+      undefined,
+    );
+  });
+
+  it("rejects a missing placement", async () => {
+    const reclaim = vi.fn();
+    const respond = await invokeReclaim(
+      makeContext({
+        workerPlacementDispatchService: { dispatch: vi.fn(), reclaim },
+        workerSessionPlacementService: {
+          getMany: () => new Map(),
+        },
+      }),
+    );
+
+    expect(reclaim).not.toHaveBeenCalled();
+    expect(respond).toHaveBeenCalledWith(
+      false,
+      undefined,
+      expect.objectContaining({ code: ErrorCodes.INVALID_REQUEST }),
     );
   });
 });

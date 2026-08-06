@@ -20,7 +20,6 @@ import {
   pluginRegistryIssueToHealthFinding,
   pluginRegistryIssueToRepairEffect,
 } from "./doctor-plugin-registry.js";
-import { DISABLE_PLUGIN_REGISTRY_MIGRATION_ENV } from "./doctor/shared/plugin-registry-migration.js";
 
 vi.mock("../../packages/terminal-core/src/note.js", () => ({
   note: vi.fn(),
@@ -279,7 +278,6 @@ function expectedPluginIndexRecord(params: {
       sidecar: false,
       memory: false,
       configPaths: [],
-      deferConfiguredChannelFullLoadUntilAfterListen: false,
       agentHarnesses: [],
     },
     contributions: {
@@ -452,16 +450,17 @@ describe("maybeRepairPluginRegistryState", () => {
     const pluginDir = path.join(stateDir, "plugins", "demo");
     fs.mkdirSync(pluginDir, { recursive: true });
     await writePersistedInstalledPluginIndex(createCurrentIndex(), { stateDir });
+    const candidate = createCandidate(pluginDir);
 
     const nextConfig = await maybeRepairPluginRegistryState({
       stateDir,
-      candidates: [createCandidate(pluginDir)],
+      candidates: [candidate],
       env: hermeticEnv(),
       config: {},
       prompter: { shouldRepair: true },
     });
 
-    expect(nextConfig).toStrictEqual({});
+    expect(nextConfig).toStrictEqual({ config: {}, pluginInventoryChanged: true });
     const persisted = await readRequiredPersistedInstalledPluginIndex(stateDir);
     expect(persisted.refreshReason).toBe("migration");
     expect(persisted.plugins).toStrictEqual([
@@ -471,22 +470,15 @@ describe("maybeRepairPluginRegistryState", () => {
         origin: "global",
       }),
     ]);
-  });
-
-  it("does not repair when registry migration is disabled", async () => {
-    const stateDir = makeTempDir();
-
-    const nextConfig = await maybeRepairPluginRegistryState({
-      stateDir,
-      env: hermeticEnv({
-        [DISABLE_PLUGIN_REGISTRY_MIGRATION_ENV]: "1",
+    await expect(
+      maybeRepairPluginRegistryState({
+        stateDir,
+        candidates: [candidate],
+        env: hermeticEnv(),
+        config: {},
+        prompter: { shouldRepair: true },
       }),
-      config: {},
-      prompter: { shouldRepair: true },
-    });
-
-    expect(nextConfig).toStrictEqual({});
-    expect(vi.mocked(note).mock.calls.join("\n")).toContain(DISABLE_PLUGIN_REGISTRY_MIGRATION_ENV);
+    ).resolves.toStrictEqual({ config: {} });
   });
 
   it("warns about stale managed npm packages that shadow bundled plugins", async () => {
@@ -921,5 +913,38 @@ describe("maybeRepairPluginRegistryState", () => {
     expect(notes).toContain("codex-plugin");
     expect(notes).toContain("openclaw doctor --fix");
     expect(fs.existsSync(linkPath)).toBe(false);
+  });
+
+  it("reports an unreadable managed npm package without aborting doctor", async () => {
+    const stateDir = makeTempDir();
+    const managed = createManagedNpmPlugin({
+      stateDir,
+      id: "broken",
+      packageName: "broken-plugin",
+      version: "2026.5.3",
+    });
+    fs.writeFileSync(path.join(managed.packageDir, "package.json"), "{", "utf8");
+    await writePersistedInstalledPluginIndex(
+      createCurrentIndexWithNpmRecord({
+        pluginId: "broken",
+        packageName: "broken-plugin",
+        packageDir: managed.packageDir,
+        version: "2026.5.3",
+      }),
+      { stateDir },
+    );
+
+    await expect(
+      maybeRepairPluginRegistryState({
+        stateDir,
+        env: hermeticEnv(),
+        config: {},
+        prompter: { shouldRepair: false },
+      }),
+    ).resolves.toEqual({ config: {} });
+
+    const notes = vi.mocked(note).mock.calls.join("\n");
+    expect(notes).toContain("Managed npm plugin packages could not be inspected");
+    expect(notes).toContain("broken-plugin");
   });
 });

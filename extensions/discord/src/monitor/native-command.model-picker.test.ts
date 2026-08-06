@@ -11,7 +11,7 @@ import type {
 import type { ModelsProviderData } from "openclaw/plugin-sdk/command-auth-native";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import * as runtimeConfigSnapshotModule from "openclaw/plugin-sdk/runtime-config-snapshot";
-import * as globalsModule from "openclaw/plugin-sdk/runtime-env";
+import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
 import {
   getSessionEntry,
   listSessionEntries,
@@ -32,6 +32,8 @@ import {
   replyWithDiscordModelPickerProviders,
 } from "./native-command-ui.js";
 import { createNoopThreadBindingManager, type ThreadBindingManager } from "./thread-bindings.js";
+
+vi.mock("openclaw/plugin-sdk/runtime-env", { spy: true });
 
 type ModelPickerContext = Parameters<typeof createDiscordModelPickerFallbackButton>[0]["ctx"];
 type PickerButton = ReturnType<typeof createDiscordModelPickerFallbackButton>;
@@ -69,9 +71,9 @@ function createModelPickerContext(): ModelPickerContext {
     },
     channels: {
       discord: {
+        dmPolicy: "open",
         dm: {
           enabled: true,
-          policy: "open",
         },
       },
     },
@@ -358,6 +360,51 @@ describe("Discord model picker interactions", () => {
     expect(interaction.editReply).toHaveBeenCalledTimes(1);
     expect(interaction.update).not.toHaveBeenCalled();
   });
+
+  it.each(["back", "nav", "bucket"] as const)(
+    "preserves the selected provider bucket for %s interactions",
+    async (action) => {
+      const context = createModelPickerContext();
+      const providers = Object.fromEntries(
+        Array.from({ length: 30 }, (_, index) => [
+          `provider-${String(index + 1).padStart(2, "0")}`,
+          ["model"],
+        ]),
+      );
+      vi.spyOn(modelPickerModule, "loadDiscordModelPickerData").mockResolvedValue(
+        createModelsProviderData(providers),
+      );
+      const selectingBucket = action === "bucket";
+      const interaction = createInteraction({
+        userId: "owner",
+        ...(selectingBucket ? { values: ["21-30"] } : {}),
+      });
+      const data = {
+        cmd: "model",
+        act: action,
+        view: "providers",
+        u: "owner",
+        pg: "3",
+        pb: selectingBucket ? "1-20" : "21-30",
+      };
+
+      if (selectingBucket) {
+        await createModelPickerFallbackSelect(context).run(
+          interaction as unknown as PickerSelectInteraction,
+          data,
+        );
+      } else {
+        await createModelPickerFallbackButton(context).run(
+          interaction as unknown as PickerButtonInteraction,
+          data,
+        );
+      }
+
+      const rendered = JSON.stringify(firstMockArg(interaction.editReply, "interaction.editReply"));
+      expect(rendered).toContain('"value":"provider-21"');
+      expect(rendered).not.toContain('"value":"provider-01"');
+    },
+  );
 
   it("uses the hot-reloaded runtime config when old components reset to default", async () => {
     const context = createModelPickerContext();
@@ -933,7 +980,9 @@ describe("Discord model picker interactions", () => {
     vi.spyOn(modelPickerModule, "loadDiscordModelPickerData").mockResolvedValue(pickerData);
     mockModelCommandPipeline(modelCommand);
     const dispatchSpy = createDispatchSpy();
-    const verboseSpy = vi.spyOn(globalsModule, "logVerbose").mockImplementation(() => {});
+    const verboseSpy = vi.mocked(logVerbose);
+    verboseSpy.mockClear();
+    verboseSpy.mockImplementation(() => {});
 
     const select = createModelPickerFallbackSelect(context, dispatchSpy);
     const selectInteraction = createInteraction({
@@ -983,6 +1032,9 @@ describe("Discord model picker interactions", () => {
       entry: {
         updatedAt: Date.now(),
         sessionId: "bound-session",
+        authProfileOverride: "lmstudio:work",
+        authProfileOverrideSource: "user",
+        authProfileOverrideCompactionCount: 2,
       },
     });
 
@@ -1007,6 +1059,9 @@ describe("Discord model picker interactions", () => {
     expect(entry?.providerOverride).toBe("lmstudio");
     expect(entry?.modelOverride).toBe("unsloth/gemma-4-26b-a4b-it@iq4_xs");
     expect(entry?.liveModelSwitchPending).toBe(true);
+    expect(entry?.authProfileOverride).toBe("lmstudio:work");
+    expect(entry?.authProfileOverrideSource).toBe("user");
+    expect(entry?.authProfileOverrideCompactionCount).toBe(2);
     expectDispatchedModelSelection({
       dispatchSpy,
       model: "lmstudio/unsloth/gemma-4-26b-a4b-it@iq4_xs",
@@ -1014,6 +1069,61 @@ describe("Discord model picker interactions", () => {
     expect(
       JSON.stringify(firstMockArg(submitInteraction.followUp, "interaction.followUp")),
     ).toContain("✅ Model set to lmstudio/unsloth/gemma-4-26b-a4b-it@iq4_xs.");
+  });
+
+  it("preserves auth profiles through provider aliases in the direct persistence fallback", async () => {
+    const context = createModelPickerContext();
+    context.cfg.plugins = { allow: ["byteplus"] };
+    context.threadBindings = createBoundThreadBindingManager({
+      accountId: "default",
+      threadId: "thread-auth-alias",
+      targetSessionKey: "agent:worker:subagent:auth-alias",
+      agentId: "worker",
+    });
+    const pickerData = createModelsProviderData({
+      anthropic: ["claude-sonnet-4-5"],
+      "byteplus-plan": ["ark-code-latest"],
+    });
+    const modelCommand = createModelCommandDefinition();
+    const storePath = resolveStorePath(context.cfg.session?.store, { agentId: "worker" });
+    await upsertSessionEntry({
+      storePath,
+      sessionKey: "agent:worker:subagent:auth-alias",
+      entry: {
+        updatedAt: Date.now(),
+        sessionId: "auth-alias-session",
+        authProfileOverride: "byteplus:work",
+        authProfileOverrideSource: "user",
+        authProfileOverrideCompactionCount: 2,
+      },
+    });
+
+    vi.spyOn(modelPickerModule, "loadDiscordModelPickerData").mockResolvedValue(pickerData);
+    mockModelCommandPipeline(modelCommand);
+
+    const dispatchSpy = createDispatchSpy();
+    const button = createModelPickerFallbackButton(context, dispatchSpy);
+    const submitInteraction = createInteraction({ userId: "owner" });
+    submitInteraction.channel = {
+      type: ChannelType.PublicThread,
+      id: "thread-auth-alias",
+    };
+
+    await button.run(submitInteraction as unknown as PickerButtonInteraction, {
+      ...createModelsViewSubmitData(),
+      p: "byteplus-plan",
+      mi: "1",
+    });
+
+    const entry = getSessionEntry({
+      storePath,
+      sessionKey: "agent:worker:subagent:auth-alias",
+    });
+    expect(entry?.providerOverride).toBe("byteplus-plan");
+    expect(entry?.modelOverride).toBe("ark-code-latest");
+    expect(entry?.authProfileOverride).toBe("byteplus:work");
+    expect(entry?.authProfileOverrideSource).toBe("user");
+    expect(entry?.authProfileOverrideCompactionCount).toBe(2);
   });
 
   it("does not write a fallback override when hidden /model dispatch is rejected", async () => {

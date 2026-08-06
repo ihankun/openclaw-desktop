@@ -1,18 +1,45 @@
+import { randomUUID } from "node:crypto";
 import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
 import type { AgentRunTerminalOutcome } from "../../agents/agent-run-terminal-outcome.js";
-import { consumeExecApprovalFollowupRuntimeHandoff } from "../../agents/bash-tools.exec-approval-followup-state.js";
+import {
+  claimExecApprovalFollowupRuntimeHandoff,
+  finalizeExecApprovalFollowupRuntimeHandoff,
+  releaseExecApprovalFollowupRuntimeHandoff,
+} from "../../agents/bash-tools.exec-approval-followup-state.js";
+import {
+  buildExecApprovalContinuationPrompt,
+  EXEC_APPROVAL_FOLLOWUP_HANDOFF_MESSAGE,
+  type ExecApprovalContinuationPromptRange,
+} from "../../agents/bash-tools.exec-approval-output.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "../../agents/harness/hook-helpers.js";
+import { repairMainSessionRecoveryMutation } from "../../agents/main-session-recovery-lifecycle.js";
+import { scheduleMainSessionRecoveryPendingTarget } from "../../agents/main-session-recovery-owner-release.js";
+import {
+  releaseMainSessionRecoveryOwner,
+  type MainSessionRecoveryPendingTarget,
+  type MainSessionRecoveryOwnerLease,
+} from "../../agents/main-session-recovery-store.js";
+import { resolveScheduledToolPolicyContext } from "../../agents/scheduled-tool-policy.js";
 import { resolveIngressWorkspaceOverrideForSessionRun } from "../../agents/spawned-context.js";
+import { isExecutionIdentityCollectionEnabled } from "../../audit/audit-config.js";
+import {
+  setChannelSourceTurnId,
+  setChannelSourceTurnSameThreadRequired,
+} from "../../auto-reply/reply/source-turn-id.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import { resolveAgentIdFromSessionKey } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { MediaFact } from "../../media/media-facts.js";
 import type { PromptImageOrderEntry } from "../../media/prompt-image-order.js";
 import { retainGatewayRootWorkAdmissionContinuation } from "../../process/gateway-work-admission.js";
 import {
   annotateInterSessionPromptText,
   type InputProvenance,
 } from "../../sessions/input-provenance.js";
-import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
+import {
+  buildRunUserTurnIdempotencyKey,
+  createUserTurnTranscriptRecorder,
+} from "../../sessions/user-turn-transcript.js";
 import { reactivateCompletedSubagentSession } from "../session-subagent-reactivation.js";
 import { loadSessionEntry } from "../session-utils.js";
 import { formatForLog } from "../ws-log.js";
@@ -25,6 +52,10 @@ import {
   type RestoredCronContinuation,
 } from "./agent-handler-helpers.js";
 import type { AgentRunRequest } from "./agent-request-types.js";
+import {
+  resolveAgentRestartRecoveryChannelContext,
+  resolveAgentRestartRecoveryExecutionIdentityAdmission,
+} from "./agent-restart-recovery-context.js";
 import type { PreparedAgentRunDispatch } from "./agent-run-admission-phase.js";
 import {
   resolveAbortedAgentStopReason,
@@ -32,11 +63,13 @@ import {
 } from "./agent-run-dispatch.js";
 import { createAgentRunModelSelectionHandler } from "./agent-run-model-selection.js";
 import { resolveSessionRuntimeCwd } from "./agent-session-reset.js";
+import { gatewayClientSenderFields } from "./gateway-client-identity.js";
 import { emitSessionsChanged } from "./session-change-event.js";
 import type { GatewayRequestHandlerOptions } from "./types.js";
 
 export function startAgentRunExecution(params: {
   prepared: PreparedAgentRunDispatch;
+  mainRestartRecoveryOwnerLease?: MainSessionRecoveryOwnerLease;
   request: AgentRunRequest;
   cfg: OpenClawConfig;
   cfgForAgent?: OpenClawConfig;
@@ -51,10 +84,12 @@ export function startAgentRunExecution(params: {
   isNewSession: boolean;
   isRawModelRun: boolean;
   isOneShotModelRun: boolean;
+  isRestartRecoveryResumeRun: boolean;
   suppressVisibleSessionEffects: boolean;
   message: string;
   images: Array<{ type: "image"; data: string; mimeType: string }>;
   imageOrder: PromptImageOrderEntry[];
+  media: MediaFact[];
   effectiveTranscriptInputText: string;
   inputProvenance?: InputProvenance;
   runId: string;
@@ -93,8 +128,12 @@ export function startAgentRunExecution(params: {
   void prepared.activeGatewayWorkAdmission.run(async () => {
     await yieldAfterAgentAcceptedAck();
     let dispatched = false;
+    const execApprovalFollowupHandoffClaimId = randomUUID();
+    let claimedExecApprovalFollowupHandoffId: string | undefined;
+    let pendingRecovery: MainSessionRecoveryPendingTarget | undefined;
     try {
       if (prepared.activeRunAbort.controller.signal.aborted) {
+        pendingRecovery = await prepared.restoreAdmittedRestartRecoveryInterrupted?.();
         const stopReason = resolveAbortedAgentStopReason(prepared.activeRunAbort.entry);
         setAbortedAgentDedupeEntries({
           dedupe: params.context.dedupe,
@@ -119,11 +158,58 @@ export function startAgentRunExecution(params: {
         return;
       }
 
+      let execApprovalFollowupRuntimeHandoff =
+        params.canUseInternalRuntimeHandoff && params.execApprovalFollowupApprovalId
+          ? claimExecApprovalFollowupRuntimeHandoff({
+              handoffId: params.request.internalRuntimeHandoffId,
+              approvalId: params.execApprovalFollowupApprovalId,
+              idempotencyKey: params.idempotencyKey,
+              sessionKey: params.resolvedSessionKey,
+              claimId: execApprovalFollowupHandoffClaimId,
+            })
+          : undefined;
+      if (
+        !execApprovalFollowupRuntimeHandoff &&
+        params.canUseInternalRuntimeHandoff &&
+        params.execApprovalFollowupApprovalId &&
+        params.requestedSessionKeyRaw &&
+        params.requestedSessionKeyRaw !== params.resolvedSessionKey
+      ) {
+        execApprovalFollowupRuntimeHandoff = claimExecApprovalFollowupRuntimeHandoff({
+          handoffId: params.request.internalRuntimeHandoffId,
+          approvalId: params.execApprovalFollowupApprovalId,
+          idempotencyKey: params.idempotencyKey,
+          sessionKey: params.requestedSessionKeyRaw,
+          claimId: execApprovalFollowupHandoffClaimId,
+        });
+      }
+      if (execApprovalFollowupRuntimeHandoff) {
+        claimedExecApprovalFollowupHandoffId = params.request.internalRuntimeHandoffId;
+      }
+
+      let message = params.message;
+      let effectiveTranscriptInputText = params.effectiveTranscriptInputText;
+      let execApprovalContinuationPromptRange: ExecApprovalContinuationPromptRange | undefined;
+      let execApprovalContinuationTranscriptPromptRange:
+        | ExecApprovalContinuationPromptRange
+        | undefined;
+      if (execApprovalFollowupRuntimeHandoff?.resultText !== undefined) {
+        const continuation = buildExecApprovalContinuationPrompt(
+          execApprovalFollowupRuntimeHandoff.resultText,
+        );
+        message = continuation.message;
+        effectiveTranscriptInputText = continuation.message;
+        execApprovalContinuationPromptRange = continuation.resultRange;
+        execApprovalContinuationTranscriptPromptRange = continuation.resultRange;
+      } else if (message === EXEC_APPROVAL_FOLLOWUP_HANDOFF_MESSAGE) {
+        throw new Error("exec approval followup runtime handoff is unavailable");
+      }
+
       if (!params.isOneShotModelRun && params.resolvedSessionKey) {
         await reactivateCompletedSubagentSession({
           sessionKey: params.resolvedSessionKey,
           runId: params.runId,
-          task: params.message,
+          task: message,
         });
       }
       if (
@@ -150,10 +236,23 @@ export function startAgentRunExecution(params: {
         });
       }
 
-      let message = params.message;
       if (!params.isRawModelRun) {
-        message = annotateInterSessionPromptText(message, params.inputProvenance);
+        const unannotatedMessage = message;
+        message = annotateInterSessionPromptText(unannotatedMessage, params.inputProvenance);
+        if (execApprovalContinuationPromptRange) {
+          if (!message.endsWith(unannotatedMessage)) {
+            throw new Error("exec approval continuation prompt range could not be annotated");
+          }
+          const offset = message.length - unannotatedMessage.length;
+          execApprovalContinuationPromptRange = {
+            start: offset + execApprovalContinuationPromptRange.start,
+            end: offset + execApprovalContinuationPromptRange.end,
+          };
+        }
       }
+      const senderIsOwner = params.restoredCronContinuation
+        ? true
+        : clientHasAdminScope(params.client);
       const userTurnTranscriptRecorder =
         params.resolvedSessionKey &&
         params.resolvedSessionId &&
@@ -162,9 +261,11 @@ export function startAgentRunExecution(params: {
         params.imageOrder.length === 0
           ? createUserTurnTranscriptRecorder({
               input: {
-                text: params.effectiveTranscriptInputText,
+                text: effectiveTranscriptInputText,
                 timestamp: Date.now(),
-                idempotencyKey: `${params.runId}:user`,
+                idempotencyKey: buildRunUserTurnIdempotencyKey(params.runId),
+                ...gatewayClientSenderFields(params.client),
+                senderIsOwner,
                 ...(params.inputProvenance ? { provenance: params.inputProvenance } : {}),
               },
               target: () => {
@@ -184,7 +285,6 @@ export function startAgentRunExecution(params: {
                     : {
                         sessionId: params.resolvedSessionId!,
                         updatedAt: Date.now(),
-                        sessionFile: params.sessionEntry?.sessionFile,
                       };
                 if (!latestEntry) {
                   return undefined;
@@ -221,29 +321,6 @@ export function startAgentRunExecution(params: {
                 resolveAgentIdFromSessionKey(params.resolvedSessionKey) === params.agentId)
             ? params.agentId
             : undefined;
-      let execApprovalFollowupRuntimeHandoff =
-        params.canUseInternalRuntimeHandoff && params.execApprovalFollowupApprovalId
-          ? consumeExecApprovalFollowupRuntimeHandoff({
-              handoffId: params.request.internalRuntimeHandoffId,
-              approvalId: params.execApprovalFollowupApprovalId,
-              idempotencyKey: params.idempotencyKey,
-              sessionKey: params.resolvedSessionKey,
-            })
-          : undefined;
-      if (
-        !execApprovalFollowupRuntimeHandoff &&
-        params.canUseInternalRuntimeHandoff &&
-        params.execApprovalFollowupApprovalId &&
-        params.requestedSessionKeyRaw &&
-        params.requestedSessionKeyRaw !== params.resolvedSessionKey
-      ) {
-        execApprovalFollowupRuntimeHandoff = consumeExecApprovalFollowupRuntimeHandoff({
-          handoffId: params.request.internalRuntimeHandoffId,
-          approvalId: params.execApprovalFollowupApprovalId,
-          idempotencyKey: params.idempotencyKey,
-          sessionKey: params.requestedSessionKeyRaw,
-        });
-      }
       // Plugin-owned additive grants stay internal to the authenticated in-process run.
       // Public agent params cannot supply them, and normal tool policy still filters them.
       const runtimePluginToolGrant =
@@ -252,12 +329,46 @@ export function startAgentRunExecution(params: {
           params.client.internal.runtimePluginToolGrant?.pluginId
           ? params.client.internal.runtimePluginToolGrant
           : undefined;
+      const executionIdentityAdmission = resolveAgentRestartRecoveryExecutionIdentityAdmission({
+        collectionEnabled: isExecutionIdentityCollectionEnabled(params.cfg),
+        isRestartRecoveryResumeRun: params.isRestartRecoveryResumeRun,
+        retryOnly: params.request.internalExecutionIdentityRetry,
+        runId: params.runId,
+        sessionEntry: params.sessionEntry,
+      });
+      const restartRecoveryChannelContext = resolveAgentRestartRecoveryChannelContext({
+        canUseInternalRuntimeHandoff: params.canUseInternalRuntimeHandoff,
+        expectedExistingSessionId: params.request.expectedExistingSessionId,
+        resolvedSessionId: params.resolvedSessionId,
+        runId: params.runId,
+        sessionEntry: params.sessionEntry,
+      });
+      const runContext = {
+        messageChannel:
+          restartRecoveryChannelContext?.channel ?? params.delivery.originMessageChannel,
+        accountId:
+          restartRecoveryChannelContext?.requesterAccountId ?? params.delivery.resolvedAccountId,
+        senderId: restartRecoveryChannelContext?.requesterSenderId,
+        groupId: params.groupId,
+        groupChannel: params.groupChannel,
+        groupSpace: params.groupSpace,
+        currentChannelId: restartRecoveryChannelContext?.currentChannelId,
+        currentThreadTs:
+          restartRecoveryChannelContext?.currentThreadTs ??
+          (prepared.resolvedThreadId != null ? String(prepared.resolvedThreadId) : undefined),
+      };
+      setChannelSourceTurnId(runContext, restartRecoveryChannelContext?.sourceTurnId);
+      setChannelSourceTurnSameThreadRequired(
+        runContext,
+        restartRecoveryChannelContext?.sameChannelThreadRequired,
+      );
 
       dispatchAgentRunFromGateway({
         ingressOpts: {
           message,
           images: params.images,
           imageOrder: params.imageOrder,
+          media: params.media,
           agentId: ingressAgentId,
           provider: prepared.effectiveProviderOverride,
           model: prepared.effectiveModelOverride,
@@ -270,17 +381,13 @@ export function startAgentRunExecution(params: {
           channel: params.delivery.resolvedChannel,
           accountId: params.delivery.resolvedAccountId,
           threadId: prepared.resolvedThreadId,
-          runContext: {
-            messageChannel: params.delivery.originMessageChannel,
-            accountId: params.delivery.resolvedAccountId,
-            groupId: params.groupId,
-            groupChannel: params.groupChannel,
-            groupSpace: params.groupSpace,
-            currentThreadTs:
-              prepared.resolvedThreadId != null ? String(prepared.resolvedThreadId) : undefined,
-          },
+          runContext,
           ...(execApprovalFollowupRuntimeHandoff?.bashElevated
             ? { bashElevated: execApprovalFollowupRuntimeHandoff.bashElevated }
+            : {}),
+          ...(execApprovalContinuationPromptRange ? { execApprovalContinuationPromptRange } : {}),
+          ...(execApprovalContinuationTranscriptPromptRange
+            ? { execApprovalContinuationTranscriptPromptRange }
             : {}),
           groupId: params.groupId,
           groupChannel: params.groupChannel,
@@ -298,16 +405,21 @@ export function startAgentRunExecution(params: {
           bootstrapContextRunKind: params.effectiveBootstrapContextRunKind,
           toolsAllow: params.restoredCronContinuation?.toolsAllow,
           runtimePluginToolGrant,
+          trustedInternalHandoff: prepared.trustedInternalHandoff,
           toolsAllowIsDefault: params.restoredCronContinuation?.toolsAllowIsDefault,
+          scheduledToolPolicy: params.restoredCronContinuation
+            ? resolveScheduledToolPolicyContext({
+                toolsAllow: params.restoredCronContinuation.toolsAllow,
+                scheduledToolPolicy: params.restoredCronContinuation.scheduledToolPolicy,
+              })
+            : undefined,
           requireExplicitMessageTarget:
             params.restoredCronContinuation?.cliSessionBindingFacts?.requireExplicitMessageTarget,
           cliSessionBindingFacts: params.restoredCronContinuation?.cliSessionBindingFacts,
           acpTurnSource: params.request.acpTurnSource,
           internalEvents: params.request.internalEvents,
           inputProvenance: params.inputProvenance,
-          senderIsOwner: params.restoredCronContinuation
-            ? true
-            : clientHasAdminScope(params.client),
+          senderIsOwner,
           sessionEffects: params.sessionEffects,
           skipInitialSessionTouch: params.skipAgentInitialSessionTouch,
           preserveUserFacingSessionModelState:
@@ -316,7 +428,13 @@ export function startAgentRunExecution(params: {
             ? params.restoredCronContinuation.cliSessionBindingFacts?.sourceReplyDeliveryMode
             : params.request.sourceReplyDeliveryMode,
           disableMessageTool: params.request.disableMessageTool,
+          swarmCollector: params.request.swarmCollector,
+          swarmOutputSchema: params.request.swarmOutputSchema,
           forceRestartSafeTools: params.request.forceRestartSafeTools,
+          forceCodeModeTools: params.request.forceCodeModeTools,
+          ...(executionIdentityAdmission ? { executionIdentityAdmission } : {}),
+          internalDeliveryMediaUrls: params.client?.internal?.internalDeliveryMediaUrls,
+          internalDeliverySuppressText: params.client?.internal?.internalDeliverySuppressText,
           suppressPromptPersistence:
             params.requestedPromptPersistenceSuppression ||
             shouldSuppressAgentPromptPersistence({
@@ -327,6 +445,7 @@ export function startAgentRunExecution(params: {
           cleanupBundleMcpOnRunEnd: params.request.cleanupBundleMcpOnRunEnd,
           abortSignal: prepared.activeRunAbort.controller.signal,
           lifecycleGeneration: params.lifecycleGeneration,
+          onExecutionStarted: () => prepared.activeRunAbort.markExecutionStarted(),
           onActiveModelSelected: createAgentRunModelSelectionHandler({
             context: params.context,
             runId: params.runId,
@@ -337,6 +456,7 @@ export function startAgentRunExecution(params: {
             resolvedSessionKey: params.resolvedSessionKey,
             lifecycleStorePath: prepared.lifecycleStorePath,
             activeSessionAgentId: params.activeSessionAgentId,
+            trustedInternalHandoff: prepared.trustedInternalHandoff,
           }),
           onSessionIdChanged: (sessionId) => {
             if (prepared.activeRunAbort.entry) {
@@ -353,6 +473,10 @@ export function startAgentRunExecution(params: {
             sessionEntry: params.sessionEntry,
           }),
           allowGatewaySubagentBinding: true,
+          ...(params.mainRestartRecoveryOwnerLease
+            ? { mainRestartRecoveryOwnerLease: params.mainRestartRecoveryOwnerLease }
+            : {}),
+          ...(params.isRestartRecoveryResumeRun ? { mainRestartRecoveryAdmitted: true } : {}),
           allowModelOverride: prepared.effectiveAllowModelOverride,
         },
         runId: params.runId,
@@ -369,8 +493,13 @@ export function startAgentRunExecution(params: {
         respond: params.respond,
         context: params.context,
         taskTrackingMode: prepared.dispatchTaskTrackingMode,
+        restoreAdmittedRecovery: prepared.restoreAdmittedRestartRecoveryInterrupted,
       });
       dispatched = true;
+      finalizeExecApprovalFollowupRuntimeHandoff({
+        handoffId: claimedExecApprovalFollowupHandoffId,
+        claimId: execApprovalFollowupHandoffClaimId,
+      });
     } catch (err) {
       const error = errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err));
       const payload = {
@@ -389,10 +518,42 @@ export function startAgentRunExecution(params: {
       });
     } finally {
       if (!dispatched) {
+        releaseExecApprovalFollowupRuntimeHandoff({
+          handoffId: claimedExecApprovalFollowupHandoffId,
+          claimId: execApprovalFollowupHandoffClaimId,
+        });
         try {
-          await params.releaseCronContinuationClaimWithRecovery();
+          const restoreAdmittedRecovery = prepared.restoreAdmittedRestartRecoveryInterrupted;
+          if (restoreAdmittedRecovery) {
+            pendingRecovery ??= await repairMainSessionRecoveryMutation({
+              mutation: restoreAdmittedRecovery,
+              onDeferredSuccess: scheduleMainSessionRecoveryPendingTarget,
+              onError: (err) =>
+                params.context.logGateway.warn(
+                  `failed to restore undispatched restart recovery: ${formatForLog(err)}`,
+                ),
+            });
+          }
         } finally {
-          cleanupAdmittedRun({ force: true });
+          try {
+            await params.releaseCronContinuationClaimWithRecovery();
+          } finally {
+            try {
+              pendingRecovery ??= await releaseMainSessionRecoveryOwner(
+                params.mainRestartRecoveryOwnerLease,
+              );
+            } catch (err) {
+              params.context.logGateway.warn(
+                `failed to release undispatched main restart recovery owner: ${formatForLog(err)}`,
+              );
+            } finally {
+              try {
+                cleanupAdmittedRun({ force: true });
+              } finally {
+                scheduleMainSessionRecoveryPendingTarget(pendingRecovery);
+              }
+            }
+          }
         }
       }
     }

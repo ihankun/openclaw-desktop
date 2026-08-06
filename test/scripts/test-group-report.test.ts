@@ -882,9 +882,7 @@ describe("scripts/test-group-report arg parsing", () => {
               flag,
               expectDefined(values[1], `second ${flag} value`),
             ];
-      expect(() => parseTestGroupReportArgs(args)).toThrow(
-        `${String(flag)} was provided more than once`,
-      );
+      expect(() => parseTestGroupReportArgs(args)).toThrow(`${flag} was provided more than once`);
     }
     expect(parseTestGroupReportArgs(["--config", "a.ts", "--config", "b.ts"]).configs).toEqual([
       "a.ts",
@@ -983,7 +981,7 @@ describe("scripts/test-group-report child process guard", () => {
       {
         cwd: process.cwd(),
         env: process.env,
-        killGraceMs: 50,
+        killGraceMs: 25,
         timeoutMs: 250,
       },
     );
@@ -1015,13 +1013,13 @@ describe("scripts/test-group-report child process guard", () => {
           [
             "import fs from 'node:fs';",
             "process.on('SIGTERM', () => {});",
-            `setInterval(() => fs.appendFileSync(${JSON.stringify(markerPath)}, "x"), 20);`,
+            `setInterval(() => fs.appendFileSync(${JSON.stringify(markerPath)}, "x"), 5);`,
           ].join("\n"),
         ],
         {
           cwd: process.cwd(),
           env: process.env,
-          killGraceMs: 50,
+          killGraceMs: 25,
           timeoutMs: 250,
         },
       );
@@ -1035,7 +1033,7 @@ describe("scripts/test-group-report child process guard", () => {
 
       const sizeAfterReturn = fs.existsSync(markerPath) ? fs.statSync(markerPath).size : 0;
       await new Promise((resolve) => {
-        setTimeout(resolve, 150);
+        setTimeout(resolve, 40);
       });
       const sizeAfterWait = fs.existsSync(markerPath) ? fs.statSync(markerPath).size : 0;
       expect(sizeAfterWait).toBe(sizeAfterReturn);
@@ -1066,7 +1064,7 @@ describe("scripts/test-group-report child process guard", () => {
         "const result = await spawnText(",
         '  "/usr/bin/time",',
         `  [process.execPath, "--eval", ${JSON.stringify(childScript)}],`,
-        "  { cwd: process.cwd(), env: process.env, killGraceMs: 50, timeoutMs: 500 },",
+        "  { cwd: process.cwd(), env: process.env, killGraceMs: 25, timeoutMs: 500 },",
         ");",
         "process.stdout.write(JSON.stringify(result));",
       ].join("\n");
@@ -1107,10 +1105,14 @@ describe("scripts/test-group-report child process guard", () => {
     let childPid: number | undefined;
     let runner: ReturnType<typeof spawn> | undefined;
     try {
+      // Publish the pid via rename so it appears atomically: waitForFile polls
+      // existence only, and a direct writeFileSync leaves an empty-file window
+      // that made the pid parse as NaN (isProcessAlive false) on loaded CI.
       const childScript = [
         "const fs = require('node:fs');",
         "process.on('SIGTERM', () => {});",
-        `fs.writeFileSync(${JSON.stringify(childPidPath)}, String(process.pid));`,
+        `fs.writeFileSync(${JSON.stringify(`${childPidPath}.tmp`)}, String(process.pid));`,
+        `fs.renameSync(${JSON.stringify(`${childPidPath}.tmp`)}, ${JSON.stringify(childPidPath)});`,
         "setInterval(() => {}, 1000);",
       ].join("\n");
       const parentScript = [
@@ -1133,8 +1135,10 @@ describe("scripts/test-group-report child process guard", () => {
         cwd: process.cwd(),
         stdio: ["ignore", "ignore", "pipe"],
       });
-      await waitForFile(readyPath, 2_000);
-      await waitForFile(childPidPath, 2_000);
+      // Generous poll deadlines: spawning the nested runner/parent/child node
+      // chain can take multiple seconds on loaded CI runners.
+      await waitForFile(readyPath, 10_000);
+      await waitForFile(childPidPath, 10_000);
       childPid = Number.parseInt(fs.readFileSync(childPidPath, "utf8"), 10);
       expect(isProcessAlive(childPid)).toBe(true);
 
@@ -1144,7 +1148,7 @@ describe("scripts/test-group-report child process guard", () => {
         code: null,
         signal: "SIGTERM",
       });
-      await waitForDead(childPid, 2_000);
+      await waitForDead(childPid, 10_000);
     } finally {
       if (runner?.pid && isProcessAlive(runner.pid)) {
         runner.kill("SIGKILL");

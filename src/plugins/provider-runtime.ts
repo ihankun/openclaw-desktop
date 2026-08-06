@@ -4,13 +4,10 @@ import {
   normalizeProviderId,
 } from "@openclaw/model-catalog-core/provider-id";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import {
-  sortUniqueStrings,
-  uniqueStrings,
-} from "@openclaw/normalization-core/string-normalization";
-import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import type { AuthProfileCredential, OAuthCredential } from "../agents/auth-profiles/types.js";
 import { resolveGpt5SystemPromptContribution } from "../agents/gpt5-prompt-overlay.js";
+import { getRegisteredAgentHarness } from "../agents/harness/registry.js";
 import {
   applyPluginTextReplacements,
   mergePluginTextTransforms,
@@ -20,11 +17,14 @@ import type { ProviderSystemPromptContribution } from "../agents/system-prompt-c
 import type { ModelProviderConfig } from "../config/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { UsageProviderId } from "../infra/provider-usage.types.js";
-import { createSubsystemLogger } from "../logging/subsystem.js";
+import { getCurrentPluginMetadataSnapshot } from "./current-plugin-metadata-snapshot.js";
 import { normalizeProviderModelIdWithManifest } from "./manifest-model-id-normalization.js";
-import type { PluginManifestRecord } from "./manifest-registry.js";
+import type { PluginManifestRecord, PluginManifestRegistry } from "./manifest-registry.js";
 import { resolvePluginMetadataSnapshot } from "./plugin-metadata-snapshot.js";
-import type { PluginMetadataRegistryView } from "./plugin-metadata-snapshot.types.js";
+import type {
+  PluginMetadataRegistryView,
+  PluginMetadataSnapshot,
+} from "./plugin-metadata-snapshot.types.js";
 import { resolvePluginDiscoveryProvidersRuntime } from "./provider-discovery.runtime.js";
 import {
   clearProviderRuntimePluginCacheForTest,
@@ -42,17 +42,19 @@ import {
   wrapProviderStreamFn,
 } from "./provider-hook-runtime.js";
 import { resolveBundledProviderPolicySurface } from "./provider-public-artifacts.js";
+import { matchesProviderPluginRef } from "./provider-registry-shared.js";
 import type { ProviderRuntimeModel } from "./provider-runtime-model.types.js";
 import type { ProviderThinkingProfile } from "./provider-thinking.types.js";
 import {
   resolveCatalogHookProviderPluginIds,
-  resolveExternalAuthProfileCompatFallbackPluginIds,
   resolveExternalAuthProfileProviderPluginIds,
   resolveOwningPluginIdsForProvider,
   resolveOwningPluginIdsForProviderRef,
+  resolveProviderRefOwnership,
   resolveUsageHookProviderPluginContracts,
 } from "./providers.js";
 import { getActivePluginRegistryWorkspaceDirFromState } from "./runtime-state.js";
+import { withPluginRuntimeRegistryScope } from "./runtime/gateway-request-scope.js";
 import { resolveRuntimeTextTransforms } from "./text-transforms.runtime.js";
 import type {
   ProviderAuthDoctorHintContext,
@@ -91,27 +93,10 @@ import type {
   ProviderResolveTransportTurnStateContext,
   ProviderSystemPromptContributionContext,
   ProviderTransformSystemPromptContext,
-  ProviderThinkingPolicyContext,
   ProviderTransportTurnState,
   ProviderValidateReplayTurnsContext,
   PluginTextTransforms,
 } from "./types.js";
-
-const log = createSubsystemLogger("plugins/provider-runtime");
-const warnedExternalAuthFallbackPluginIds = new Set<string>();
-
-function matchesProviderPluginRef(provider: ProviderPlugin, providerId: string): boolean {
-  const normalized = normalizeProviderId(providerId);
-  if (!normalized) {
-    return false;
-  }
-  if (normalizeProviderId(provider.id) === normalized) {
-    return true;
-  }
-  return [...(provider.aliases ?? []), ...(provider.hookAliases ?? [])].some(
-    (alias) => normalizeProviderId(alias) === normalized,
-  );
-}
 
 function resolveProviderHookRefs(
   provider: string,
@@ -173,26 +158,26 @@ export {
   wrapProviderStreamFn,
 };
 
-function resetExternalAuthFallbackWarningCacheForTest(): void {
-  warnedExternalAuthFallbackPluginIds.clear();
-}
-
 export const testing = {
   clearProviderRuntimePluginCacheForTest,
-  resetExternalAuthFallbackWarningCacheForTest,
 } as const;
 
 function resolveProviderPluginsForCatalogHooks(params: {
   config?: OpenClawConfig;
   workspaceDir?: string;
   env?: NodeJS.ProcessEnv;
+  metadataSnapshot?: PluginMetadataSnapshot;
 }): ProviderPlugin[] {
-  const workspaceDir = params.workspaceDir ?? getActivePluginRegistryWorkspaceDirFromState();
+  const workspaceDir =
+    params.workspaceDir ??
+    params.metadataSnapshot?.workspaceDir ??
+    getActivePluginRegistryWorkspaceDirFromState();
   const env = params.env ?? process.env;
   const onlyPluginIds = resolveCatalogHookProviderPluginIds({
     config: params.config,
     workspaceDir,
     env,
+    metadataSnapshot: params.metadataSnapshot,
   });
   if (onlyPluginIds.length === 0) {
     return [];
@@ -202,6 +187,7 @@ function resolveProviderPluginsForCatalogHooks(params: {
     workspaceDir,
     env,
     onlyPluginIds,
+    pluginMetadataSnapshot: params.metadataSnapshot,
   });
 }
 
@@ -460,12 +446,15 @@ export function normalizeProviderConfigWithPlugin(params: {
   config?: OpenClawConfig;
   workspaceDir?: string;
   env?: NodeJS.ProcessEnv;
+  manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
   context: ProviderNormalizeConfigContext;
   allowRuntimePluginLoad?: boolean;
 }): ModelProviderConfig | undefined {
   const hasConfigChange = (normalized: ModelProviderConfig) =>
     normalized !== params.context.providerConfig;
-  const bundledSurface = resolveBundledProviderPolicySurface(params.provider);
+  const bundledSurface = resolveBundledProviderPolicySurface(params.provider, {
+    manifestRegistry: params.manifestRegistry,
+  });
   if (bundledSurface?.normalizeConfig) {
     const normalized = bundledSurface.normalizeConfig(params.context);
     return normalized && hasConfigChange(normalized) ? normalized : undefined;
@@ -503,10 +492,13 @@ export function resolveProviderConfigApiKeyWithPlugin(params: {
   config?: OpenClawConfig;
   workspaceDir?: string;
   env?: NodeJS.ProcessEnv;
+  manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
   context: ProviderResolveConfigApiKeyContext;
   allowRuntimePluginLoad?: boolean;
 }): string | undefined {
-  const bundledSurface = resolveBundledProviderPolicySurface(params.provider);
+  const bundledSurface = resolveBundledProviderPolicySurface(params.provider, {
+    manifestRegistry: params.manifestRegistry,
+  });
   if (bundledSurface?.resolveConfigApiKey) {
     return normalizeOptionalString(bundledSurface.resolveConfigApiKey(params.context));
   }
@@ -688,7 +680,47 @@ export async function resolveProviderUsageSnapshotWithPlugin(params: {
   env?: NodeJS.ProcessEnv;
   context: ProviderFetchUsageSnapshotContext;
 }) {
-  return await resolveProviderRuntimePlugin(params)?.fetchUsageSnapshot?.(params.context);
+  const providerHook = resolveProviderRuntimePlugin(params)?.fetchUsageSnapshot;
+  if (providerHook) {
+    const snapshot = await providerHook(params.context);
+    if (snapshot != null) {
+      return snapshot;
+    }
+  }
+
+  // A distinct hook owner is an explicit synthetic contribution route. Avoid
+  // probing harness manifests for ordinary provider usage misses.
+  if (params.provider === params.context.provider) {
+    return undefined;
+  }
+
+  const harness = getRegisteredAgentHarness(params.provider)?.harness;
+  if (!harness) {
+    const workspaceDir =
+      params.workspaceDir ?? getActivePluginRegistryWorkspaceDirFromState() ?? process.cwd();
+    const { loadAgentRuntimePluginRegistryHandle } = await import("../agents/runtime-plugins.js");
+    const { ensureSelectedAgentHarnessPlugin } =
+      await import("../agents/harness/runtime-plugin.js");
+    const pluginRegistry = loadAgentRuntimePluginRegistryHandle({
+      config: params.config,
+      workspaceDir,
+      selections: [{ provider: params.context.provider, modelId: "", runtime: params.provider }],
+    });
+    return await withPluginRuntimeRegistryScope(pluginRegistry, async () => {
+      await ensureSelectedAgentHarnessPlugin({
+        provider: params.context.provider,
+        modelId: "",
+        config: params.config,
+        agentHarnessId: params.provider,
+        workspaceDir,
+        pluginRegistry,
+      });
+      return await getRegisteredAgentHarness(params.provider)?.harness.fetchUsageSnapshot?.(
+        params.context,
+      );
+    });
+  }
+  return await harness?.fetchUsageSnapshot?.(params.context);
 }
 
 export type ProviderUsagePluginDescriptor = {
@@ -802,6 +834,59 @@ export function formatProviderAuthProfileApiKeyWithPlugin(params: {
   return resolveProviderRuntimePlugin(params)?.formatApiKey?.(params.context);
 }
 
+export async function loginProviderOAuthWithPlugin(params: {
+  provider: string;
+  config?: OpenClawConfig;
+  workspaceDir?: string;
+  env?: NodeJS.ProcessEnv;
+  context: Parameters<NonNullable<ProviderPlugin["loginOAuth"]>>[0];
+}) {
+  const ownership = resolveProviderRefOwnership(params);
+  const loginOAuth = resolveProviderRuntimePlugin(params)?.loginOAuth;
+  if (!loginOAuth) {
+    return {
+      status: ownership.status === "unowned" ? "unowned" : "configured-unavailable",
+    } as const;
+  }
+  return {
+    status: "available" as const,
+    credentials: await loginOAuth(params.context),
+  };
+}
+
+export async function resolveProviderOAuthCredentialWithPlugin(params: {
+  provider: string;
+  config?: OpenClawConfig;
+  workspaceDir?: string;
+  env?: NodeJS.ProcessEnv;
+  credential: OAuthCredential;
+  refresh: boolean;
+}) {
+  const ownership = resolveProviderRefOwnership(params);
+  const plugin = resolveProviderRuntimePlugin(params);
+  if (!plugin) {
+    return {
+      status: ownership.status === "unowned" ? "unowned" : "configured-unavailable",
+    } as const;
+  }
+  let credential = params.credential;
+  if (params.refresh) {
+    const refreshOAuth = plugin.refreshOAuth;
+    if (!refreshOAuth) {
+      return { status: "unhandled" } as const;
+    }
+    credential = await refreshOAuth(params.credential);
+  }
+  if (!credential) {
+    return { status: "unhandled" } as const;
+  }
+  const apiKey = plugin.formatApiKey?.(credential) ?? credential.access;
+  if (typeof apiKey !== "string" || !apiKey) {
+    return { status: "unhandled" } as const;
+  }
+  return { status: "available" as const, credential, apiKey };
+}
+
 export async function refreshProviderOAuthCredentialWithPlugin(params: {
   provider: string;
   config?: OpenClawConfig;
@@ -832,26 +917,6 @@ export function resolveProviderCacheTtlEligibility(params: {
   return resolveProviderRuntimePlugin(params)?.isCacheTtlEligible?.(params.context);
 }
 
-export function resolveProviderBinaryThinking(params: {
-  provider: string;
-  config?: OpenClawConfig;
-  workspaceDir?: string;
-  env?: NodeJS.ProcessEnv;
-  context: ProviderThinkingPolicyContext;
-}) {
-  return resolveProviderRuntimePlugin(params)?.isBinaryThinking?.(params.context);
-}
-
-export function resolveProviderXHighThinking(params: {
-  provider: string;
-  config?: OpenClawConfig;
-  workspaceDir?: string;
-  env?: NodeJS.ProcessEnv;
-  context: ProviderThinkingPolicyContext;
-}) {
-  return resolveProviderRuntimePlugin(params)?.supportsXHighThinking?.(params.context);
-}
-
 export function resolveProviderThinkingProfile(params: {
   provider: string;
   config?: OpenClawConfig;
@@ -864,16 +929,6 @@ export function resolveProviderThinkingProfile(params: {
     return bundledSurface.resolveThinkingProfile(params.context) ?? undefined;
   }
   return resolveProviderRuntimePlugin(params)?.resolveThinkingProfile?.(params.context);
-}
-
-export function resolveProviderDefaultThinkingLevel(params: {
-  provider: string;
-  config?: OpenClawConfig;
-  workspaceDir?: string;
-  env?: NodeJS.ProcessEnv;
-  context: ProviderDefaultThinkingPolicyContext;
-}) {
-  return resolveProviderRuntimePlugin(params)?.resolveDefaultThinkingLevel?.(params.context);
 }
 
 export function applyProviderConfigDefaultsWithPlugin(params: {
@@ -1004,27 +1059,29 @@ export function resolveExternalAuthProfilesWithPlugins(params: {
 }): ProviderExternalAuthProfile[] {
   const workspaceDir = params.workspaceDir ?? getActivePluginRegistryWorkspaceDirFromState();
   const env = params.env ?? process.env;
-  const { manifestRegistry } = resolvePluginMetadataSnapshot({
-    config: params.config ?? {},
-    workspaceDir,
+  const config = params.config ?? {};
+  const currentMetadataSnapshot = getCurrentPluginMetadataSnapshot({
+    config,
     env,
+    ...(workspaceDir === undefined ? { allowWorkspaceScopedSnapshot: true } : { workspaceDir }),
   });
+  const { manifestRegistry } =
+    currentMetadataSnapshot ?? resolvePluginMetadataSnapshot({ config, workspaceDir, env });
+  // A lifecycle-owned manifest is authoritative: no external-auth contracts means
+  // no provider registry discovery or runtime activation is needed for this overlay.
+  if (
+    currentMetadataSnapshot &&
+    !manifestRegistry.plugins.some((plugin) => plugin.contracts?.externalAuthProviders?.length)
+  ) {
+    return [];
+  }
   const externalAuthPluginIds = resolveExternalAuthProfileProviderPluginIds({
     config: params.config,
     workspaceDir,
     env,
     manifestRegistry,
   });
-  const declaredPluginIds = new Set(externalAuthPluginIds);
-  const fallbackPluginIds = resolveExternalAuthProfileCompatFallbackPluginIds({
-    config: params.config,
-    workspaceDir,
-    env,
-    declaredPluginIds,
-    manifestRegistry,
-  });
-  const pluginIds = sortUniqueStrings([...externalAuthPluginIds, ...fallbackPluginIds]);
-  if (pluginIds.length === 0) {
+  if (externalAuthPluginIds.length === 0) {
     return [];
   }
   const matches: ProviderExternalAuthProfile[] = [];
@@ -1032,20 +1089,11 @@ export function resolveExternalAuthProfilesWithPlugins(params: {
     ...params,
     workspaceDir,
     env,
-    onlyPluginIds: pluginIds,
+    onlyPluginIds: externalAuthPluginIds,
   })) {
-    const profiles =
-      plugin.resolveExternalAuthProfiles?.(params.context) ??
-      plugin.resolveExternalOAuthProfiles?.(params.context);
+    const profiles = plugin.resolveExternalAuthProfiles?.(params.context);
     if (!profiles || profiles.length === 0) {
       continue;
-    }
-    const pluginId = plugin.pluginId ?? plugin.id;
-    if (!declaredPluginIds.has(pluginId) && !warnedExternalAuthFallbackPluginIds.has(pluginId)) {
-      warnedExternalAuthFallbackPluginIds.add(pluginId);
-      log.warn(
-        `Provider plugin "${sanitizeForLog(pluginId)}" uses external auth hooks without declaring contracts.externalAuthProviders. This compatibility fallback is deprecated and will be removed in a future release.`,
-      );
     }
     matches.push(...profiles);
   }
@@ -1081,6 +1129,7 @@ export async function augmentModelCatalogWithProviderPlugins(params: {
   config?: OpenClawConfig;
   workspaceDir?: string;
   env?: NodeJS.ProcessEnv;
+  metadataSnapshot?: PluginMetadataSnapshot;
   context: ProviderAugmentModelCatalogContext;
 }) {
   const supplemental = [] as ProviderAugmentModelCatalogContext["entries"];

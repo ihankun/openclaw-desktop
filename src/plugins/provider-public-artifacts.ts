@@ -1,3 +1,4 @@
+import path from "node:path";
 // Extracts provider public artifacts from plugin metadata.
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { resolveBundledPluginsDir } from "./bundled-dir.js";
@@ -6,12 +7,13 @@ import {
   resolveDirectBundledProviderPolicySurface,
   resolveTrustedExternalProviderPolicySurface,
   type BundledProviderPolicySurface,
+  type ProviderPolicySurface,
 } from "./provider-policy-surface.js";
 
-function resolveBundledProviderPolicyPluginId(
+function resolveBundledProviderPolicyPlugin(
   providerId: string,
   options: { manifestRegistry?: Pick<PluginManifestRegistry, "plugins"> } = {},
-): string | null {
+): PluginManifestRegistry["plugins"][number] | null {
   const normalizedProviderId = normalizeProviderId(providerId);
   if (!normalizedProviderId) {
     return null;
@@ -29,7 +31,7 @@ function resolveBundledProviderPolicyPluginId(
       continue;
     }
     if (pluginOwnsProviderPolicyRef(plugin, normalizedProviderId)) {
-      return plugin.id;
+      return plugin;
     }
   }
 
@@ -73,18 +75,26 @@ export function resolveBundledProviderPolicySurface(
   if (directSurface) {
     return directSurface;
   }
-  const ownerPluginId = resolveBundledProviderPolicyPluginId(normalizedProviderId, options);
-  if (!ownerPluginId || ownerPluginId === normalizedProviderId) {
+  const ownerPlugin = resolveBundledProviderPolicyPlugin(normalizedProviderId, options);
+  if (ownerPlugin) {
+    const ownerSurface = resolveDirectBundledProviderPolicySurface(ownerPlugin.id);
+    if (ownerSurface) {
+      return ownerSurface;
+    }
+  }
+  if (!ownerPlugin) {
     return null;
   }
-  return resolveDirectBundledProviderPolicySurface(ownerPluginId);
+  // A stable plugin id can differ from its stock directory name. Use the
+  // registry-owned root basename so its pre-runtime policy stays discoverable.
+  return resolveDirectBundledProviderPolicySurface(path.basename(ownerPlugin.rootDir));
 }
 
 /** Resolves provider policy hooks from bundled or trusted official plugin artifacts. */
 export function resolveProviderPolicySurface(
   providerId: string,
   options: { manifestRegistry?: Pick<PluginManifestRegistry, "plugins"> } = {},
-): BundledProviderPolicySurface | null {
+): ProviderPolicySurface | null {
   const bundledSurface = resolveBundledProviderPolicySurface(providerId, options);
   if (bundledSurface) {
     return bundledSurface;

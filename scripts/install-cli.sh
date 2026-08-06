@@ -64,6 +64,7 @@ resolve_openclaw_effective_home() {
 OPENCLAW_EFFECTIVE_HOME="$(resolve_openclaw_effective_home)"
 PREFIX="${OPENCLAW_PREFIX:-${HOME}/.openclaw}"
 OPENCLAW_VERSION="${OPENCLAW_VERSION:-latest}"
+REQUIRED_COMPATIBLE_VERSION=""
 DEFAULT_NODE_VERSION="24.15.0"
 ARMV7_DEFAULT_NODE_VERSION="22.22.3"
 NODE_VERSION="${OPENCLAW_NODE_VERSION:-${DEFAULT_NODE_VERSION}}"
@@ -95,6 +96,7 @@ Usage: install-cli.sh [options]
   --git, --github                     Shortcut for --install-method git
   --git-dir, --dir <path>             Checkout directory (default: ~/openclaw, or \$OPENCLAW_HOME/openclaw)
   --version <ver>                     OpenClaw version (default: latest)
+  --compatible-with <ver>             Refuse a CLI that cannot modify config written by <ver>
   --node-version <ver>                Node version (default: 24.15.0; 22.22.3 on Linux ARMv7)
   --onboard                           Run "openclaw onboard" after install
   --no-onboard                        Skip onboarding (default)
@@ -137,7 +139,11 @@ download_file() {
     detect_downloader
   fi
   if [[ "$DOWNLOADER" == "curl" ]]; then
-    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --retry-connrefused -o "$output" "$url"
+    # Bound post-connect stalls without imposing a total download duration.
+    curl -fsSL --proto '=https' --tlsv1.2 \
+      --speed-limit 1 --speed-time 30 \
+      --retry 3 --retry-delay 1 --retry-connrefused \
+      -o "$output" "$url"
     return
   fi
   wget -q --https-only --secure-protocol=TLSv1_2 --tries=3 --timeout=20 -O "$output" "$url"
@@ -283,6 +289,13 @@ parse_args() {
           fail "Missing value for $1"
         fi
         OPENCLAW_VERSION="$2"
+        shift 2
+        ;;
+      --compatible-with)
+        if [[ $# -lt 2 || "${2:-}" == --* ]]; then
+          fail "Missing value for $1"
+        fi
+        REQUIRED_COMPATIBLE_VERSION="$2"
         shift 2
         ;;
       --node-version)
@@ -443,6 +456,7 @@ link_node_runtime_paths() {
 }
 
 linked_node_is_usable() {
+  local candidate_bin
   local current_version
   local required_version
 
@@ -456,6 +470,10 @@ linked_node_is_usable() {
     return 1
   fi
   if ! semver_at_least "$current_version" "$required_version"; then
+    return 1
+  fi
+  candidate_bin="$(node_dir)/bin"
+  if ! PATH="${candidate_bin}:${PATH}" "$(npm_bin)" --version >/dev/null 2>&1; then
     return 1
   fi
 
@@ -621,7 +639,7 @@ install_alpine_node() {
     installed_version="$("$(node_bin)" -v 2>/dev/null || echo unknown)"
     required_version="$(required_node_version)"
     sqlite_version="$(linked_node_sqlite_version)"
-    fail "Alpine Node package must provide Node >= ${required_version} with WAL-reset-safe SQLite 3.51.3+ (or patched 3.50.7+/3.44.6+); found Node ${installed_version}, SQLite ${sqlite_version}."
+    fail "Alpine Node package must provide Node >= ${required_version} with WAL-reset-safe SQLite 3.51.3+, 3.50.7+ within 3.50.x, or 3.44.6+ within 3.44.x; found Node ${installed_version}, SQLite ${sqlite_version}."
   fi
 
   installed_version="$("$(node_bin)" -v 2>/dev/null || echo unknown)"
@@ -714,6 +732,122 @@ is_openclaw_source_package_install_spec() {
   [[ "$normalized_value" =~ ^git://github\.com/openclaw/openclaw(\.git)?($|[?#]) ]] && return 0
   [[ "$normalized_value" =~ ^git@github\.com:openclaw/openclaw(\.git)?($|[?#]) ]] && return 0
   return 1
+}
+
+openclaw_version_is_compatible_with() {
+  local candidate="$1"
+  local config_writer="$2"
+
+  "$(node_bin)" - "$candidate" "$config_writer" <<'NODE'
+const candidateRaw = process.argv[2];
+const writerRaw = process.argv[3];
+
+function parse(raw) {
+  let value = String(raw ?? "").trim();
+  const legacyBeta = /^([vV]?\d+\.\d+\.\d+)\.beta(?:\.([0-9A-Za-z.-]+))?$/.exec(value);
+  if (legacyBeta) {
+    value = `${legacyBeta[1]}-beta${legacyBeta[2] ? `.${legacyBeta[2]}` : ""}`;
+  }
+  const match = /^[vV]?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/.exec(value);
+  if (!match) return null;
+  const parseIdentifiers = (rawIdentifiers) => {
+    if (!rawIdentifiers) return [];
+    const identifiers = rawIdentifiers.split(".");
+    if (identifiers.some((identifier) => identifier.length === 0)) return null;
+    return identifiers.map((identifier) => {
+      if (!/^\d+$/.test(identifier)) return identifier;
+      if (identifier.length > 1 && identifier.startsWith("0")) return null;
+      return Number(identifier);
+    });
+  };
+  const prerelease = parseIdentifiers(match[4]);
+  const build = parseIdentifiers(match[5]);
+  if (!prerelease || !build || prerelease.includes(null) || build.includes(null)) return null;
+  return {
+    core: [Number(match[1]), Number(match[2]), Number(match[3])],
+    prerelease,
+    build,
+  };
+}
+
+function compareIdentifiers(left, right) {
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const a = left[index];
+    const b = right[index];
+    if (a === undefined) return -1;
+    if (b === undefined) return 1;
+    if (a === b) continue;
+    if (typeof a === "number" && typeof b === "number") return a < b ? -1 : 1;
+    if (typeof a === "number") return -1;
+    if (typeof b === "number") return 1;
+    return a < b ? -1 : 1;
+  }
+  return 0;
+}
+
+function isCorrection(version) {
+  return version.prerelease.length === 1 && typeof version.prerelease[0] === "number";
+}
+
+function comparable(version) {
+  if (!isCorrection(version)) return version;
+  return { ...version, prerelease: [], build: [version.prerelease[0]] };
+}
+
+function compare(leftRaw, rightRaw) {
+  const left = comparable(leftRaw);
+  const right = comparable(rightRaw);
+  for (let index = 0; index < left.core.length; index += 1) {
+    if (left.core[index] !== right.core[index]) {
+      return left.core[index] < right.core[index] ? -1 : 1;
+    }
+  }
+  if (left.prerelease.length === 0 && right.prerelease.length > 0) return 1;
+  if (right.prerelease.length === 0 && left.prerelease.length > 0) return -1;
+  const prereleaseOrder = compareIdentifiers(left.prerelease, right.prerelease);
+  return prereleaseOrder === 0 ? compareIdentifiers(left.build, right.build) : prereleaseOrder;
+}
+
+const candidate = parse(candidateRaw);
+const writer = parse(writerRaw);
+if (!candidate || !writer) process.exit(2);
+const sameCore = candidate.core.every((part, index) => part === writer.core[index]);
+if (sameCore && (writer.prerelease.length === 0 || isCorrection(writer))) process.exit(0);
+process.exit(compare(candidate, writer) < 0 ? 1 : 0);
+NODE
+}
+
+require_openclaw_version_compatible() {
+  local candidate="$1"
+  local config_writer="${REQUIRED_COMPATIBLE_VERSION:-}"
+  if [[ -z "$config_writer" ]]; then
+    return 0
+  fi
+
+  if openclaw_version_is_compatible_with "$candidate" "$config_writer"; then
+    return 0
+  fi
+  local status="$?"
+  if [[ "$status" -eq 2 ]]; then
+    fail "Cannot compare resolved OpenClaw version '${candidate}' with config writer '${config_writer}'."
+  fi
+  fail "OpenClaw ${candidate} is older than config writer ${config_writer}. Choose a newer CLI channel or retry after the channel is updated."
+}
+
+resolve_npm_openclaw_version() {
+  local requested="$1"
+  "$(npm_bin)" view "openclaw@${requested}" version 2>/dev/null | awk 'NF { value = $0 } END { print value }'
+}
+
+resolve_git_checkout_openclaw_version() {
+  local repo_dir="$1"
+  "$(node_bin)" -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const value = JSON.parse(fs.readFileSync(path.join(process.argv[1], "package.json"), "utf8")).version;
+    if (typeof value !== "string" || value.trim() === "") process.exit(1);
+    process.stdout.write(value.trim());
+  ' "$repo_dir"
 }
 
 resolve_git_openclaw_ref() {
@@ -1093,6 +1227,14 @@ install_openclaw() {
     --no-audit
     "$freshness_flag"
   )
+  local resolved_requested="$requested"
+  if [[ -n "${REQUIRED_COMPATIBLE_VERSION:-}" ]]; then
+    resolved_requested="$(resolve_npm_openclaw_version "$requested")"
+    if [[ -z "$resolved_requested" ]]; then
+      fail "Could not resolve OpenClaw ${requested} before compatibility checking."
+    fi
+    require_openclaw_version_compatible "$resolved_requested"
+  fi
   emit_json "{\"event\":\"step\",\"name\":\"openclaw\",\"status\":\"start\",\"version\":\"${requested}\"}"
   log "Installing OpenClaw (${requested})..."
   if [[ "$SET_NPM_PREFIX" -eq 1 ]]; then
@@ -1100,14 +1242,22 @@ install_openclaw() {
   fi
 
   if [[ "${requested}" == "latest" ]]; then
-    if ! env -u NPM_CONFIG_BEFORE -u npm_config_before -u NPM_CONFIG_MIN_RELEASE_AGE -u npm_config_min_release_age -u npm_config_min-release-age "$(npm_bin)" install -g --prefix "$(node_dir)" "${npm_args[@]}" "openclaw@latest"; then
+    if ! env -u NPM_CONFIG_BEFORE -u npm_config_before -u NPM_CONFIG_MIN_RELEASE_AGE -u npm_config_min_release_age -u npm_config_min-release-age "$(npm_bin)" install -g --prefix "$(node_dir)" "${npm_args[@]}" "openclaw@${resolved_requested}"; then
       log "npm install openclaw@latest failed; retrying openclaw@next"
       emit_json "{\"event\":\"step\",\"name\":\"openclaw\",\"status\":\"retry\",\"version\":\"next\"}"
-      env -u NPM_CONFIG_BEFORE -u npm_config_before -u NPM_CONFIG_MIN_RELEASE_AGE -u npm_config_min_release_age -u npm_config_min-release-age "$(npm_bin)" install -g --prefix "$(node_dir)" "${npm_args[@]}" "openclaw@next"
+      resolved_requested="next"
+      if [[ -n "${REQUIRED_COMPATIBLE_VERSION:-}" ]]; then
+        resolved_requested="$(resolve_npm_openclaw_version next)"
+        if [[ -z "$resolved_requested" ]]; then
+          fail "Could not resolve OpenClaw next before compatibility checking."
+        fi
+        require_openclaw_version_compatible "$resolved_requested"
+      fi
+      env -u NPM_CONFIG_BEFORE -u npm_config_before -u NPM_CONFIG_MIN_RELEASE_AGE -u npm_config_min_release_age -u npm_config_min-release-age "$(npm_bin)" install -g --prefix "$(node_dir)" "${npm_args[@]}" "openclaw@${resolved_requested}"
       requested="next"
     fi
   else
-    env -u NPM_CONFIG_BEFORE -u npm_config_before -u NPM_CONFIG_MIN_RELEASE_AGE -u npm_config_min_release_age -u npm_config_min-release-age "$(npm_bin)" install -g --prefix "$(node_dir)" "${npm_args[@]}" "openclaw@${requested}"
+    env -u NPM_CONFIG_BEFORE -u npm_config_before -u NPM_CONFIG_MIN_RELEASE_AGE -u npm_config_min_release_age -u npm_config_min-release-age "$(npm_bin)" install -g --prefix "$(node_dir)" "${npm_args[@]}" "openclaw@${resolved_requested}"
   fi
 
   mkdir -p "${PREFIX}/bin"
@@ -1177,6 +1327,11 @@ install_openclaw_from_git() {
   ensure_pnpm
   ensure_pnpm_binary_for_scripts
 
+  if [[ -d "$repo_dir/.git" ]] &&
+    ! git --git-dir="$repo_dir/.git" --work-tree="$repo_dir" rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null 2>&1; then
+    fail "Git checkout has no commit: ${repo_dir}. Move or remove this incomplete checkout, then retry."
+  fi
+
   if [[ -d "$repo_dir/.git" ]]; then
     :
   elif [[ -d "$repo_dir" ]]; then
@@ -1196,6 +1351,15 @@ install_openclaw_from_git() {
     checkout_git_openclaw_ref "$repo_dir" "$git_ref"
   else
     log "Repo is dirty; skipping git checkout/update"
+  fi
+
+  if [[ -n "${REQUIRED_COMPATIBLE_VERSION:-}" ]]; then
+    local resolved_version
+    resolved_version="$(resolve_git_checkout_openclaw_version "$repo_dir" 2>/dev/null || true)"
+    if [[ -z "$resolved_version" ]]; then
+      fail "Could not resolve the Git checkout version before compatibility checking."
+    fi
+    require_openclaw_version_compatible "$resolved_version"
   fi
 
   cleanup_legacy_submodules "$repo_dir"

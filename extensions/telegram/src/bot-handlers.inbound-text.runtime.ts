@@ -6,7 +6,9 @@ import type { TelegramHandlerMessageRuntime } from "./bot-handlers.message.runti
 import type { TelegramAmbientTranscriptWatermark } from "./bot-message-context.types.js";
 import type { RegisterTelegramHandlerParams } from "./bot-native-commands.js";
 import type { TelegramSpooledReplayDeferredParticipant } from "./bot-processing-outcome.js";
+import { joinTelegramTextParts } from "./bot/helpers.js";
 import type { TelegramContext } from "./bot/types.js";
+import type { TelegramMessageDispatchReplayClaim } from "./message-dispatch-dedupe.js";
 
 type TextFragmentEntry = {
   key: string;
@@ -14,7 +16,7 @@ type TextFragmentEntry = {
   messages: Array<{ msg: Message; ctx: TelegramContext; receivedAtMs: number }>;
   promptContextMinTimestampMs?: number;
   promptContextAmbientWatermark?: TelegramAmbientTranscriptWatermark;
-  dispatchDedupeKeys: string[];
+  dispatchDedupeClaims: TelegramMessageDispatchReplayClaim[];
   spooledReplayParticipants: TelegramSpooledReplayDeferredParticipant[];
   timer: ReturnType<typeof setTimeout>;
 };
@@ -30,7 +32,7 @@ type TelegramTextFragmentInput = {
   isAuthorizedAbortControlMessage: () => Promise<boolean>;
   promptContextMinTimestampMs?: number;
   promptContextAmbientWatermark?: TelegramAmbientTranscriptWatermark;
-  dispatchDedupeKeys: string[];
+  dispatchDedupeClaims: TelegramMessageDispatchReplayClaim[];
 };
 
 export function createTelegramInboundTextRuntime(
@@ -41,8 +43,8 @@ export function createTelegramInboundTextRuntime(
     promptContextBoundaryOptions,
     latestPromptContextMinTimestampMs,
     latestPromptContextAmbientWatermark,
-    mergeDispatchDedupeKeys,
-    releaseDispatchDedupeKeys,
+    mergeDispatchDedupeClaims,
+    releaseDispatchDedupeClaims,
     buildFailedProcessingResult,
     settleSpooledReplayParticipants,
     createSpooledReplayParticipantForBufferedWork,
@@ -66,19 +68,24 @@ export function createTelegramInboundTextRuntime(
       const first = entry.messages[0];
       const last = entry.messages.at(-1);
       if (!first || !last) {
-        releaseDispatchDedupeKeys(entry.dispatchDedupeKeys);
+        releaseDispatchDedupeClaims(entry.dispatchDedupeClaims);
         settleSpooledReplayParticipants(entry.spooledReplayParticipants, { kind: "skipped" });
         return;
       }
-      const combinedText = entry.messages.map((message) => message.msg.text ?? "").join("");
+      const combinedTextParts = joinTelegramTextParts(
+        entry.messages.map((message) => message.msg),
+        "",
+      );
+      const combinedText = combinedTextParts.text;
       if (!combinedText.trim()) {
-        releaseDispatchDedupeKeys(entry.dispatchDedupeKeys);
+        releaseDispatchDedupeClaims(entry.dispatchDedupeClaims);
         settleSpooledReplayParticipants(entry.spooledReplayParticipants, { kind: "skipped" });
         return;
       }
       const syntheticMessage = buildSyntheticTextMessage({
         base: first.msg,
         text: combinedText,
+        entities: combinedTextParts.entities,
         date: last.msg.date ?? first.msg.date,
       });
       const result = await processMessageWithReplyChain({
@@ -99,12 +106,12 @@ export function createTelegramInboundTextRuntime(
           ),
           ...spooledReplayOptions(entry.spooledReplayParticipants),
         },
-        dispatchDedupeKeys: entry.dispatchDedupeKeys,
+        dispatchDedupeClaims: entry.dispatchDedupeClaims,
         spooledReplayParticipants: entry.spooledReplayParticipants,
       });
       settleSpooledReplayParticipants(entry.spooledReplayParticipants, result);
     } catch (error) {
-      releaseDispatchDedupeKeys(entry.dispatchDedupeKeys, error);
+      releaseDispatchDedupeClaims(entry.dispatchDedupeClaims, error);
       settleSpooledReplayParticipants(
         entry.spooledReplayParticipants,
         buildFailedProcessingResult(error),
@@ -159,9 +166,9 @@ export function createTelegramInboundTextRuntime(
             existing.promptContextAmbientWatermark,
             params.promptContextAmbientWatermark,
           );
-          existing.dispatchDedupeKeys = mergeDispatchDedupeKeys(
-            existing.dispatchDedupeKeys,
-            params.dispatchDedupeKeys,
+          existing.dispatchDedupeClaims = mergeDispatchDedupeClaims(
+            existing.dispatchDedupeClaims,
+            params.dispatchDedupeClaims,
           );
           scheduleFlush(existing);
           return true;
@@ -178,7 +185,7 @@ export function createTelegramInboundTextRuntime(
           key,
           storeAllowFrom: params.storeAllowFrom,
           messages: [{ msg: params.msg, ctx: params.ctx, receivedAtMs: nowMs }],
-          dispatchDedupeKeys: params.dispatchDedupeKeys,
+          dispatchDedupeClaims: params.dispatchDedupeClaims,
           spooledReplayParticipants: participant ? [participant] : [],
           ...promptContextBoundaryOptions(
             params.promptContextMinTimestampMs,
@@ -199,7 +206,7 @@ export function createTelegramInboundTextRuntime(
       if (existing) {
         clearTimeout(existing.timer);
         buffer.delete(key);
-        releaseDispatchDedupeKeys(existing.dispatchDedupeKeys);
+        releaseDispatchDedupeClaims(existing.dispatchDedupeClaims);
         settleSpooledReplayParticipants(existing.spooledReplayParticipants, { kind: "skipped" });
       }
     }

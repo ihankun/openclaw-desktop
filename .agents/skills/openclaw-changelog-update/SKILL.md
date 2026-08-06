@@ -1,13 +1,14 @@
 ---
 name: openclaw-changelog-update
-description: Regenerate OpenClaw release changelog sections from git history before beta or stable releases.
+description: Regenerate OpenClaw release changelog sections from git history before beta, stable, or extended-stable releases.
 ---
 
 # OpenClaw Changelog Update
 
-Use this for release changelog rewrites and GitHub release-note source text.
-Run it once after the final Code SHA has green Full Release Validation. Do not
-rerun it for same-candidate tooling retries, resumed publication, or promotion.
+Use this for changelog rewrites and GitHub release-note source text. For regular
+beta/stable, run it after the Code SHA passes Full Release Validation. For
+extended-stable, run it before final exact-head validation and tagging. Do not
+rerun it for tooling retries, resumed publication, or promotion.
 Use it with `release-openclaw-maintainer`; this skill owns changelog content,
 ordering, grouping, and attribution discipline.
 
@@ -68,11 +69,17 @@ every human `Thanks @...` attribution.
      audit; it contains every referenced PR, eligible contributor credit,
      inline issue context, every direct commit, and an editorial-eligibility
      classification for PRs and direct commits
+   - schema version 3 is the required ephemeral manifest contract. Regenerate
+     older manifests; version 2 is not a supported downstream-reader boundary
    - for a historical backfill, add `--seed-ref <pre-backfill-ref>` once so
      contribution records from the prior changelog are retained even when an
      older merged commit omitted its PR number; the verifier excludes records
      for work reverted after the base tag, including beta work reverted before
      the stable release
+   - generated provenance reports in-range PRs separately from retained
+     seed-only PRs, then states the unique row total. A PR present in both
+     inventories counts as in-range; never describe the seed-inclusive total
+     as work merged in the current release range
    - add repeatable `--shipped-ref <prior-shipped-tag>` when the reachable main
      closeout differs from the shipped tag or later forward-port commits
      re-associate PRs that were already released. Each tag is a cumulative
@@ -149,6 +156,8 @@ every human `Thanks @...` attribution.
      PR references explicitly present in active commit subjects/bodies. It
      preserves author/co-author credit and any issue references in the original
      title
+   - the provenance arithmetic and unique total must match the rendered PR
+     rows exactly; candidate validation rejects malformed or forged counts
    - direct commits remain in the manifest with GitHub-resolved author,
      co-author, issue, and editorial-eligibility data. They inform grouped
      prose but are never rendered as a public `#### Direct commits` dump. Add
@@ -252,6 +261,14 @@ every human `Thanks @...` attribution.
 - dispatch SHA-pinned Full Release Validation for the Release SHA with evidence
   reuse enabled. It must select `changelog-only-release-v1`; any other changed
   path returns the release to the Code SHA validation loop
+
+## Extended-Stable Variant
+
+Extended-stable has one release commit and no GitHub Release body. After version
+prep and approved backports, regenerate `## YYYY.M.P` with the regular manifest
+and original-main-PR provenance rules. Land it by PR, then validate the final
+branch tip before tagging. Re-audit after a product backport; a tooling-only
+repair needs no changelog entry. Never rewrite a published tag or changelog.
 
 ## Quota / API Outage Rule
 

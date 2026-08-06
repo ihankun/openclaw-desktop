@@ -92,6 +92,9 @@ vi.mock("./listeners.js", () => ({
   DiscordReactionRemoveListener: function DiscordReactionRemoveListener() {
     return { type: "reaction-remove" };
   },
+  DiscordThreadDeleteListener: function DiscordThreadDeleteListener() {
+    return { type: "thread-delete" };
+  },
   DiscordThreadUpdateListener: function DiscordThreadUpdateListener() {
     return { type: "thread-update" };
   },
@@ -239,6 +242,10 @@ describe("createDiscordMonitorClient", () => {
 
   it("configures internal Discord REST options explicitly", async () => {
     const createClient = vi.fn(createClientWithPlugins);
+    const commandDeployHashStore = {
+      lookup: vi.fn(async () => undefined),
+      register: vi.fn(async () => undefined),
+    };
 
     await createDiscordMonitorClient({
       accountId: "default",
@@ -250,6 +257,7 @@ describe("createDiscordMonitorClient", () => {
       voiceEnabled: false,
       discordConfig: {},
       runtime: createRuntime(),
+      commandDeployHashStore,
       createClient,
       createGatewayPlugin: () => ({ id: "gateway" }) as never,
       createGatewaySupervisor: () => ({ shutdown: vi.fn(), handleError: vi.fn() }) as never,
@@ -264,6 +272,9 @@ describe("createDiscordMonitorClient", () => {
       runtimeProfile: "persistent",
       maxQueueSize: 1000,
     });
+    expect((options as { commandDeployHashStore?: unknown }).commandDeployHashStore).toBe(
+      commandDeployHashStore,
+    );
     if (!handlers) {
       throw new Error("expected Discord client handlers");
     }
@@ -389,7 +400,12 @@ describe("registerDiscordMonitorListeners", () => {
   it("skips reaction listeners when every configured guild disables reactions and DMs are off", () => {
     registerDiscordMonitorListeners(createListenerParams());
 
-    expect(registeredListenerTypes()).toEqual(["interaction", "message", "thread-update"]);
+    expect(registeredListenerTypes()).toEqual([
+      "interaction",
+      "message",
+      "thread-update",
+      "thread-delete",
+    ]);
   });
 
   it("keeps reaction listeners when direct messages can emit reaction notifications", () => {
@@ -432,6 +448,7 @@ describe("registerDiscordMonitorListeners", () => {
       "interaction",
       "message",
       "thread-update",
+      "thread-delete",
       "presence",
       "presence-guild-create",
       "presence-guild-delete",

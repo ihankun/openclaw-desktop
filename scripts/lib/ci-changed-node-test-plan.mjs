@@ -16,6 +16,10 @@ const MAX_CHANGED_NODE_TEST_TARGETS = 96;
 // Each target runs in its own child process (isolation contract), so bound the
 // serial tail per job; the shard runner overlaps two children at a time.
 const CHANGED_NODE_TEST_TARGETS_PER_JOB = 12;
+// Memory Core targets perform real SQLite/indexing work. Two concurrent Vitest
+// processes starve each other on 4-vCPU runners and push otherwise healthy
+// integration tests past the global timeout.
+const SERIAL_CHANGED_TARGET_RE = /^extensions\/memory-core\//u;
 const BOUNDARY_NODE_TEST_CONFIG = "test/vitest/vitest.boundary.config.ts";
 const publicPluginSdkEntrySources = Object.values(
   buildPluginSdkEntrySources(publicPluginSdkEntrypoints),
@@ -35,13 +39,23 @@ function isTestOnlyPath(changedPath) {
   return isTestFileTarget(changedPath) || changedPath.startsWith("test/");
 }
 
+// Inputs `build:ci-artifacts` consumes: runtime/plugin/package sources plus
+// the build pipeline itself (mirrors the build-all cache key in ci.yml).
+// Paths outside this set — repo scripts, workflows, qa scenarios, docs mixes —
+// cannot change dist or bundled plugin asset bytes.
+const BUILD_INPUT_RE =
+  /^(?:src|extensions|packages)\/|^(?:openclaw\.mjs|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml)$|^tsconfig[^/]*\.json$|^scripts\/(?:build-[^/]+|runtime-postbuild\.mjs|write-plugin-sdk-entry-dts\.ts)$|^scripts\/lib\/(?:copy-assets\.ts|plugin-sdk-entries\.mjs)$/u;
+
 /**
- * True when any changed path can influence built dist/packaging bytes.
- * Test-only diffs cannot change what `build:ci-artifacts` produces, so the
- * manifest may skip the build-artifacts lane for them.
+ * True when a changed path can influence built dist/packaging bytes: a
+ * non-test build-input source or the build pipeline itself. Diffs entirely
+ * outside that set (tests, repo scripts, workflows, qa scenarios) let the
+ * manifest skip the build-artifacts lane.
  */
 export function hasBuildArtifactAffectingChange(changedPaths) {
-  return changedPaths.some((changedPath) => !isTestOnlyPath(changedPath));
+  return changedPaths.some(
+    (changedPath) => BUILD_INPUT_RE.test(changedPath) && !isTestOnlyPath(changedPath),
+  );
 }
 
 // Surfaces the CI smoke scenarios exercise outside the core runtime import
@@ -52,7 +66,7 @@ export function hasBuildArtifactAffectingChange(changedPaths) {
 // orchestration (this planner, the CI workflow, composite actions) is also
 // QA-impacting: changes to the gate must not be able to skip the gated lane.
 const QA_SMOKE_SURFACE_RE =
-  /^(?:extensions\/(?:matrix|qa-lab|telegram)|packages|qa|ui)\/|^scripts\/(?:build-all\.mjs|package-openclaw-for-docker\.mjs)$|^scripts\/lib\/ci-changed-node-test-plan\.mjs$|^\.github\/(?:workflows\/ci\.yml$|actions\/)|^(?:openclaw\.mjs|package\.json|pnpm-lock\.yaml|npm-shrinkwrap\.json|pnpm-workspace\.yaml|tsdown\.config\.ts)$/u;
+  /^(?:extensions\/(?:matrix|qa-lab|telegram)|packages|qa|ui)\/|^scripts\/(?:build-all\.mjs|package-openclaw-for-docker\.mjs)$|^scripts\/lib\/ci-changed-node-test-plan\.mjs$|^\.github\/(?:workflows\/ci\.yml$|actions\/)|^(?:openclaw\.mjs|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|tsdown\.config\.ts)$/u;
 // The smoke profile runs the packaged CLI end to end, so its runtime blast
 // radius is exactly the CLI entry's import graph (dynamic imports included).
 const QA_SMOKE_RUNTIME_ENTRY = "src/index.ts";
@@ -79,6 +93,42 @@ export function hasQaSmokeAffectingChange(changedPaths, options = {}) {
     return true;
   }
   return hasImportGraphImpactOnTargets(sourcePaths, [QA_SMOKE_RUNTIME_ENTRY], cwd);
+}
+
+// Surfaces the prompt-snapshot check exercises outside its generator's
+// relative import graph: the snapshot fixtures and generator scripts, the
+// codex extension (its test API loads through a dynamic bundled-plugin module
+// id the graph walk cannot see), and the gate's own orchestration — changes
+// to the gate must not be able to skip the gated lane.
+const PROMPT_SNAPSHOT_SURFACE_RE =
+  /^(?:test\/(?:helpers\/agents|fixtures\/agents\/prompt-snapshots)|extensions\/codex|packages)\/|^scripts\/(?:generate-prompt-snapshots\.ts|prompt-snapshot-files\.[cm]?[jt]s)$|^scripts\/lib\/ci-changed-node-test-plan\.mjs$|^\.github\/(?:workflows\/ci\.yml$|actions\/)|^(?:package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml)$/u;
+// The generator renders real prompt-layer stacks, so its runtime blast radius
+// is the snapshot helper's import graph (auto-reply prompts, channel typing,
+// plugin-sdk agent harness, codex catalog fixtures).
+const PROMPT_SNAPSHOT_ENTRY = "test/helpers/agents/happy-path-prompt-snapshots.ts";
+
+/**
+ * True when a changed path can influence generated prompt snapshots: it
+ * touches the snapshot surface directly, or the generator's import graph
+ * reaches it. Diffs outside both cannot change generator output, so the
+ * manifest may skip the check lane.
+ */
+export function hasPromptSnapshotAffectingChange(changedPaths, options = {}) {
+  const cwd = options.cwd ?? process.cwd();
+  if (changedPaths.some((changedPath) => PROMPT_SNAPSHOT_SURFACE_RE.test(changedPath))) {
+    return true;
+  }
+  const sourcePaths = changedPaths.filter(
+    (changedPath) => changedPath.startsWith("src/") && !isTestFileTarget(changedPath),
+  );
+  if (sourcePaths.length === 0) {
+    return false;
+  }
+  // Deleted sources cannot be graphed; fail safe to running the check.
+  if (sourcePaths.some((changedPath) => !existsSync(path.join(cwd, changedPath)))) {
+    return true;
+  }
+  return hasImportGraphImpactOnTargets(sourcePaths, [PROMPT_SNAPSHOT_ENTRY], cwd);
 }
 
 function createBoundaryShard() {
@@ -212,7 +262,7 @@ export function createChangedNodeTestShards(changedPaths, options = {}) {
   const shards = [
     ...targetChunks.map((chunk, index) => {
       const suffix = targetChunks.length === 1 ? "" : `-${index + 1}`;
-      return {
+      const shard = {
         checkName: `checks-node-changed${suffix}`,
         configs: [],
         requiresDist: false,
@@ -220,6 +270,10 @@ export function createChangedNodeTestShards(changedPaths, options = {}) {
         shardName: `changed${suffix}`,
         targets: chunk,
       };
+      if (chunk.some((target) => SERIAL_CHANGED_TARGET_RE.test(target))) {
+        shard.planConcurrency = 1;
+      }
+      return shard;
     }),
     ...(hasBuildArtifactAffectingChange(changedPaths) ? [] : [createBoundaryShard()]),
   ];

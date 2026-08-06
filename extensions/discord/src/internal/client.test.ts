@@ -1,7 +1,4 @@
 // Discord tests cover client plugin behavior.
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { ApplicationCommandType, ComponentType, Routes } from "discord-api-types/v10";
 import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -107,6 +104,44 @@ describe("ComponentRegistry", () => {
     expect(registry.resolve("encoded:payload=two", { componentType: ComponentType.Button })).toBe(
       button,
     );
+  });
+
+  it("preserves each message owner when replacing a one-off component wait", async () => {
+    const registry = new ComponentRegistry<Button>();
+    const firstMessage = {
+      id: "message-1",
+      channelId: "channel-1",
+      owner: "first",
+    } as never;
+    const secondMessage = {
+      id: "message-1",
+      channelId: "channel-1",
+      owner: "second",
+    } as never;
+
+    const first = registry.waitForMessageComponent(firstMessage, 5_000);
+    const second = registry.waitForMessageComponent(secondMessage, 5_000);
+    const firstResult = await first;
+    const resolved = registry.resolveOneOffComponent({
+      channelId: "channel-1",
+      customId: "choice:one",
+      messageId: "message-1",
+      values: ["one"],
+    });
+    const secondResult = await second;
+
+    expect(firstResult).toMatchObject({
+      success: false,
+      reason: "timed out",
+    });
+    expect(firstResult.message).toBe(firstMessage);
+    expect(resolved).toBe(true);
+    expect(secondResult).toMatchObject({
+      success: true,
+      customId: "choice:one",
+      values: ["one"],
+    });
+    expect(secondResult.message).toBe(secondMessage);
   });
 
   it("caps oversized one-off component wait timers", () => {
@@ -392,12 +427,15 @@ describe("Client.deployCommands", () => {
   });
 
   it("skips unchanged command deploys across client restarts using the hash store", async () => {
-    const hashStorePath = path.join(
-      await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-discord-command-deploy-")),
-      "hashes.json",
-    );
+    const hashes = new Map<string, string>();
+    const commandDeployHashStore = {
+      lookup: async (key: string) => hashes.get(key),
+      register: async (key: string, value: string) => {
+        hashes.set(key, value);
+      },
+    };
     const first = createInternalTestClient([createTestCommand({ name: "one" })], {
-      commandDeployHashStorePath: hashStorePath,
+      commandDeployHashStore,
     });
     const firstGet = vi.fn(async () => []);
     const firstPost = vi.fn(async () => undefined);
@@ -406,7 +444,7 @@ describe("Client.deployCommands", () => {
     await first.deployCommands({ mode: "reconcile" });
 
     const second = createInternalTestClient([createTestCommand({ name: "one" })], {
-      commandDeployHashStorePath: hashStorePath,
+      commandDeployHashStore,
     });
     const secondGet = vi.fn(async () => []);
     const secondPost = vi.fn(async () => undefined);
@@ -510,7 +548,7 @@ describe("Client gateway event queue", () => {
     });
   });
 
-  it("times out hung queued listeners", async () => {
+  it("resolves timed-out dispatches while retaining the hung listener slot", async () => {
     vi.useFakeTimers();
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const listener = {
@@ -531,12 +569,99 @@ describe("Client gateway event queue", () => {
     );
     expect(client.getRuntimeMetrics().eventQueue).toEqual({
       queueSize: 0,
-      processing: 0,
+      processing: 1,
       processed: 1,
       dropped: 0,
       timeouts: 1,
       maxQueueSize: 10_000,
       maxConcurrency: 1,
+    });
+  });
+
+  it("holds a timed-out listener slot until its underlying promise resolves", async () => {
+    vi.useFakeTimers();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const firstSettlement = createDeferred();
+    const started: string[] = [];
+    const first = {
+      type: "READY",
+      handle: vi.fn(async () => {
+        started.push("first");
+        await firstSettlement.promise;
+      }),
+    } satisfies AnyListener;
+    const second = {
+      type: "READY",
+      handle: vi.fn(async () => {
+        started.push("second");
+      }),
+    } satisfies AnyListener;
+    const client = createQueuedClient({
+      listeners: [first, second],
+      eventQueue: { listenerTimeout: 10, maxConcurrency: 1 },
+    });
+
+    const dispatch = client.dispatchGatewayEvent("READY", {});
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(started).toEqual(["first"]);
+    expect(client.getRuntimeMetrics().eventQueue).toMatchObject({
+      queueSize: 1,
+      processing: 1,
+      processed: 1,
+      timeouts: 1,
+    });
+
+    firstSettlement.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(started).toEqual(["first", "second"]);
+    expect(first.handle).toHaveBeenCalledTimes(1);
+    expect(second.handle).toHaveBeenCalledTimes(1);
+    await expect(dispatch).resolves.toBeUndefined();
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(client.getRuntimeMetrics().eventQueue).toMatchObject({
+      queueSize: 0,
+      processing: 0,
+      processed: 2,
+      timeouts: 1,
+    });
+  });
+
+  it("logs a listener failure that arrives after its dispatch timeout", async () => {
+    vi.useFakeTimers();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const settlement = createDeferred();
+    const lateError = new Error("late listener failure");
+    const listener = {
+      type: "READY",
+      handle: vi.fn(async () => await settlement.promise),
+    } satisfies AnyListener;
+    const client = createQueuedClient({
+      listeners: [listener],
+      eventQueue: { listenerTimeout: 10, maxConcurrency: 1 },
+    });
+
+    const dispatch = client.dispatchGatewayEvent("READY", {});
+    await vi.advanceTimersByTimeAsync(10);
+    await expect(dispatch).resolves.toBeUndefined();
+
+    settlement.reject(lateError);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(errorSpy).toHaveBeenNthCalledWith(
+      1,
+      "[EventQueue] Listener Object timed out after 10ms for event READY",
+    );
+    expect(errorSpy).toHaveBeenNthCalledWith(
+      2,
+      "[EventQueue] Listener Object failed after timeout for event READY:",
+      lateError,
+    );
+    expect(client.getRuntimeMetrics().eventQueue).toMatchObject({
+      processing: 0,
+      processed: 1,
+      timeouts: 1,
     });
   });
 
