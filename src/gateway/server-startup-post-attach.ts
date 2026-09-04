@@ -16,10 +16,10 @@ import type { loadOpenClawPlugins } from "../plugins/loader.js";
 import { getPluginModuleLoaderStats } from "../plugins/plugin-module-loader-cache.js";
 import type { PluginRegistry } from "../plugins/registry.js";
 import type { PluginServicesHandle } from "../plugins/services.js";
-import {
-  GATEWAY_EVENT_UPDATE_AVAILABLE,
-  type GatewayUpdateAvailableEventPayload,
-} from "./events.js";
+// import {
+//   GATEWAY_EVENT_UPDATE_AVAILABLE,
+//   type GatewayUpdateAvailableEventPayload,
+// } from "./events.js";
 import { STARTUP_UNAVAILABLE_GATEWAY_METHODS } from "./methods/core-descriptors.js";
 import type { refreshLatestUpdateRestartSentinel } from "./server-restart-sentinel.js";
 import type { logGatewayStartup } from "./server-startup-log.js";
@@ -1006,7 +1006,7 @@ const defaultGatewayPostAttachRuntimeDeps: GatewayPostAttachRuntimeDeps = {
     (await import("./server-tailscale.js")).startGatewayTailscaleExposure(...args),
 };
 
-function createDeferredGatewayUpdateCheck(params: {
+function createDeferredGatewayUpdateCheck(_params: {
   startupTrace?: GatewayStartupTrace;
   runtimeDeps: GatewayPostAttachRuntimeDeps;
   cfg: OpenClawConfig;
@@ -1032,37 +1032,38 @@ function createDeferredGatewayUpdateCheck(params: {
       return;
     }
     started = true;
+    // Startup version check disabled (commented out on request).
     // Update checks are intentionally post-attach so startup logging, sidecars,
     // and Tailscale exposure are not serialized behind network I/O.
-    setImmediate(() => {
-      if (stopped) {
-        return;
-      }
-      void measureStartup(params.startupTrace, "post-attach.update-check", () =>
-        params.runtimeDeps.scheduleGatewayUpdateCheck({
-          cfg: params.cfg,
-          log: params.log,
-          isNixMode: params.isNixMode,
-          onUpdateAvailableChange: (updateAvailable) => {
-            const payload: GatewayUpdateAvailableEventPayload = { updateAvailable };
-            params.broadcast(GATEWAY_EVENT_UPDATE_AVAILABLE, payload, { dropIfSlow: true });
-          },
-        }),
-      )
-        .then((nextStop) => {
-          if (stopped) {
-            nextStop();
-            return;
-          }
-          stopUpdateCheck = nextStop;
-        })
-        .catch((err: unknown) => {
-          if (stopped) {
-            return;
-          }
-          params.log.warn(`gateway update check failed to start: ${String(err)}`);
-        });
-    });
+    // setImmediate(() => {
+    //   if (stopped) {
+    //     return;
+    //   }
+    //   void measureStartup(params.startupTrace, "post-attach.update-check", () =>
+    //     params.runtimeDeps.scheduleGatewayUpdateCheck({
+    //       cfg: params.cfg,
+    //       log: params.log,
+    //       isNixMode: params.isNixMode,
+    //       onUpdateAvailableChange: (updateAvailable) => {
+    //         const payload: GatewayUpdateAvailableEventPayload = { updateAvailable };
+    //         params.broadcast(GATEWAY_EVENT_UPDATE_AVAILABLE, payload, { dropIfSlow: true });
+    //       },
+    //     }),
+    //   )
+    //     .then((nextStop) => {
+    //       if (stopped) {
+    //         nextStop();
+    //         return;
+    //       }
+    //       stopUpdateCheck = nextStop;
+    //     })
+    //     .catch((err: unknown) => {
+    //       if (stopped) {
+    //         return;
+    //       }
+    //       params.log.warn(`gateway update check failed to start: ${String(err)}`);
+    //     });
+    // });
   };
 
   return { start, stop };

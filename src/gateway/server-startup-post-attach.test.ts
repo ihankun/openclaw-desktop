@@ -470,7 +470,7 @@ describe("startGatewayPostAttachRuntime", () => {
     expect(events).toEqual(["startup-log-start", "sidecars", "startup-log-end"]);
   });
 
-  it("starts the gateway update check after post-attach returns", async () => {
+  it("does not start the gateway update check after post-attach returns", async () => {
     const events: string[] = [];
     const stopUpdateCheck = vi.fn();
     const scheduleGatewayUpdateCheck = vi.fn(async () => {
@@ -492,27 +492,18 @@ describe("startGatewayPostAttachRuntime", () => {
     );
     events.push("returned");
 
-    expect(scheduleGatewayUpdateCheck).not.toHaveBeenCalled();
     expect(events).toEqual(["sidecars", "returned"]);
-
     await vi.waitFor(() => {
-      expect(scheduleGatewayUpdateCheck).toHaveBeenCalledTimes(1);
+      expect(scheduleGatewayUpdateCheck).not.toHaveBeenCalled();
     });
-    expect(events).toEqual(["sidecars", "returned", "update-check"]);
 
     result.stopGatewayUpdateCheck();
-    expect(stopUpdateCheck).toHaveBeenCalledTimes(1);
+    expect(stopUpdateCheck).not.toHaveBeenCalled();
   });
 
-  it("stops the gateway update check if close wins the deferred startup race", async () => {
-    let finishUpdateCheckSchedule: (() => void) | undefined;
+  it("stops gracefully when no gateway update check was scheduled", async () => {
     const stopUpdateCheck = vi.fn();
-    const scheduleGatewayUpdateCheck = vi.fn(
-      async () =>
-        await new Promise<() => void>((resolve) => {
-          finishUpdateCheckSchedule = () => resolve(stopUpdateCheck);
-        }),
-    );
+    const scheduleGatewayUpdateCheck = vi.fn(async () => stopUpdateCheck);
 
     const result = await startGatewayPostAttachRuntime(
       createPostAttachParams(),
@@ -522,23 +513,12 @@ describe("startGatewayPostAttachRuntime", () => {
       }),
     );
 
-    await vi.waitFor(() => {
-      expect(scheduleGatewayUpdateCheck).toHaveBeenCalledTimes(1);
-    });
     result.stopGatewayUpdateCheck();
+    expect(scheduleGatewayUpdateCheck).not.toHaveBeenCalled();
     expect(stopUpdateCheck).not.toHaveBeenCalled();
-
-    if (!finishUpdateCheckSchedule) {
-      throw new Error("Expected update check schedule release callback to be initialized");
-    }
-    finishUpdateCheckSchedule();
-
-    await vi.waitFor(() => {
-      expect(stopUpdateCheck).toHaveBeenCalledTimes(1);
-    });
   });
 
-  it("logs deferred gateway update check startup failures without failing ready", async () => {
+  it("does not run the deferred gateway update check at startup", async () => {
     const log = { info: vi.fn(), warn: vi.fn() };
     const scheduleGatewayUpdateCheck = vi.fn(async () => {
       throw new Error("boom");
@@ -562,8 +542,9 @@ describe("startGatewayPostAttachRuntime", () => {
     );
 
     await vi.waitFor(() => {
-      expect(log.warn).toHaveBeenCalledWith("gateway update check failed to start: Error: boom");
+      expect(scheduleGatewayUpdateCheck).not.toHaveBeenCalled();
     });
+    expect(log.warn).not.toHaveBeenCalled();
   });
 
   it("skips heavy restart sentinel refresh when no sentinel file exists", async () => {
@@ -1026,7 +1007,7 @@ describe("startGatewayPostAttachRuntime", () => {
       });
 
       await vi.advanceTimersToNextTimerAsync();
-      await vi.advanceTimersToNextTimerAsync();
+      await vi.advanceTimersByTimeAsync(500);
       expect(postReadyRequestTurn).toHaveBeenCalledTimes(1);
       expect(onPostReadySidecars.mock.calls[0]?.[0]).toHaveLength(0);
       expect(onGatewayLifetimeSidecars.mock.calls[0]?.[0]).toHaveLength(2);
@@ -1036,7 +1017,7 @@ describe("startGatewayPostAttachRuntime", () => {
       });
       expect(hoisted.warmCurrentProviderAuthStateOffMainThread).not.toHaveBeenCalled();
 
-      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(500);
       await vi.waitFor(() => {
         expect(hoisted.warmCurrentProviderAuthStateOffMainThread).toHaveBeenCalledTimes(1);
       });
